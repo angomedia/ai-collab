@@ -1,0 +1,46 @@
+{
+  "name": "ai-collab",
+  "productName": "AI Collab",
+  "version": "1.6.0",
+  "description": "A local desktop room for Codex and Claude Code to work through a goal together.",
+  "private": true,
+  "license": "MIT",
+  "author": "AI Collab contributors",
+  "homepage": "https://github.com/angomedia/ai-collab",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/angomedia/ai-collab.git"
+  },
+  "type": "module",
+  "main": "src/main/main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.mjs",
+    "test:gui": "node tests/gui-smoke.mjs",
+    "build:reader": "node scripts/build-document-reader.mjs",
+    "package": "node scripts/package.mjs",
+    "dist": "node scripts/build-release.mjs",
+    "test:release": "node tests/release-smoke.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "44.9.0",
+    "electron-builder": "26.15.3",
+    "playwright": "^1.64.1"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.304",
+    "cross-spawn": "7.0.6",
+    "exceljs": "4.4.0",
+    "officeparser": "8.1.1"
+  }
+}

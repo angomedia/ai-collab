@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>AI Collab</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Chats">
+      <div class="sidebar-titlebar"></div>
+      <div class="brand">AI Collab</div>
+      <button id="new-chat" class="new-chat"><span aria-hidden="true">＋</span> New chat <kbd>⌘ N</kbd></button>
+      <nav id="chat-list" class="chat-list" aria-label="Chat history"></nav>
+      <div class="connections"><div class="connections-heading"><button id="open-connections" class="connections-open" aria-haspopup="dialog" aria-controls="connections-dialog">Connections <span aria-hidden="true">›</span></button><button id="refresh-providers" title="Refresh connections" aria-label="Refresh connections">↻</button></div><div id="provider-codex" class="provider-connection"></div><div id="provider-claude" class="provider-connection"></div></div>
+    </aside>
+    <main class="main-panel">
+      <header class="topbar"><h1 id="chat-title">New chat</h1><div class="header-actions"><span id="chat-status" class="chat-status" hidden></span><button id="view-active" class="quiet-button" hidden>Open active chat</button><button id="stop-active-run" class="stop-button" hidden><span aria-hidden="true">■</span> Stop</button><button id="export-run" class="quiet-button" hidden>Export</button></div></header>
+      <div id="chat-scroll" class="chat-scroll">
+        <div id="empty-state" class="empty-state"><h2>What should we work through?</h2></div>
+        <div id="thread" class="thread" aria-label="Conversation"></div>
+        <div id="live-status" class="live-status" role="status" hidden><span class="working-dot" aria-hidden="true"></span><span id="live-status-text">Getting started…</span></div>
+        <div id="run-error" class="run-error" role="alert" hidden></div>
+      </div>
+      <div class="composer-area">
+        <button id="jump-latest" class="jump-latest" hidden>↓ Latest messages</button>
+        <section id="chat-settings" class="chat-settings" aria-label="Chat settings" hidden><div class="settings-heading"><strong>Chat settings</strong><button id="close-settings" class="close-button" aria-label="Close settings">×</button></div><div class="settings-fields"><label for="codex-model">Codex (ChatGPT)<select id="codex-model"><option value="">CLI default</option></select></label><label for="claude-model">Claude<select id="claude-model"><option value="">CLI default</option></select></label><label for="moderator-model">Moderator<select id="moderator-model"><option value="gpt-6-sol">GPT-6 Sol</option></select></label><label for="timeout-minutes">Time limit per question<select id="timeout-minutes"><option value="10">10 minutes</option><option value="20" selected>20 minutes</option><option value="40">40 minutes</option><option value="60">60 minutes</option></select></label></div><div class="settings-defaults"><button type="button" id="save-defaults" class="quiet-button">Save as defaults</button><span id="defaults-status" role="status" hidden></span></div><div class="model-discovery"><span id="model-discovery-note">Loading model choices…</span><button type="button" id="refresh-models" class="text-button">Refresh models</button></div><p class="settings-note">The moderator uses your Codex connection. Model access follows your provider plan and extra usage settings. Some choices may require additional credits.</p><details class="settings-details"><summary>Files and privacy</summary><p>Attach PDF, Word, RTF, text, CSV, TSV, JSON, or XLSX files. Up to 8 files, 25 MB each, and 200,000 extracted characters per chat. PDF scans use on-device OCR on macOS. Windows requires PDFs with selectable text. Images and charts are not interpreted.</p><p>Your questions, extracted files, and the conversation are shared with both providers through your existing CLI logins. The app saves chat history on this computer. Live web research and file editing are off.</p></details></section>
+        <div id="source-preview" class="source-preview" hidden><div><strong id="source-preview-title"></strong><button id="close-source-preview" class="close-button" aria-label="Close source preview">×</button></div><pre id="source-preview-text"></pre><p id="source-preview-warning" hidden></p></div>
+        <form id="goal-form" class="goal-form">
+          <div id="source-list" class="source-list" aria-label="Attached source files" hidden></div>
+          <label for="goal" class="sr-only">Your question or follow-up</label><textarea id="goal" maxlength="20000" rows="2" placeholder="Ask Codex and Claude…" required></textarea>
+          <div class="composer-tools"><button type="button" id="attach-files" class="tool-button" title="Attach files" aria-label="Attach files"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 13 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 0 1-7-7l9-9a2 2 0 0 1 3 3l-9 9a1 1 0 0 0 2 2l8-8"/></svg><span id="attach-files-label">Attach</span></button><button type="button" id="settings-toggle" class="tool-button" aria-controls="chat-settings" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg><span>Models &amp; time</span></button><span id="composer-context" class="composer-context"></span><button type="submit" id="start-debate" class="send-button" title="Send question (⌘ Enter)" aria-label="Send question"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button></div>
+        </form>
+        <div id="composer-notice" class="composer-notice" role="status" hidden></div>
+        <div id="attachment-errors" class="attachment-errors" role="alert" hidden><div><strong>Some files couldn’t be added</strong><button type="button" id="clear-attachment-errors" class="text-button">Dismiss</button></div><ul id="attachment-error-list"></ul></div>
+        <div id="send-error" class="send-error" role="alert" hidden></div>
+      </div>
+      <div id="boot-error" class="boot-error" role="alert" hidden><h2>The app couldn’t connect.</h2><p id="boot-error-message"></p><button id="reload-app" class="quiet-button">Try again</button></div>
+    </main>
+  </div>
+  <dialog id="connections-dialog" class="connections-dialog" aria-labelledby="connections-title" aria-describedby="connections-description"><div class="connection-dialog-heading"><h2 id="connections-title">Connect your assistants</h2><button id="close-connections" class="close-button" aria-label="Close connections">×</button></div><p id="connections-description" class="connection-dialog-description">Use your own eligible Codex and Claude accounts. Setup opens Terminal and your browser; sign in there, and the app detects the connection automatically.</p><p id="connections-active-notice" class="connections-active-notice" hidden>Connection changes are unavailable while a chat is running. Stop the chat before changing setup.</p><div id="connection-codex" class="connection-card"></div><div id="connection-claude" class="connection-card"></div><div class="connections-dialog-footer"><button id="refresh-connections" class="quiet-button">Refresh status</button><button id="done-connections" class="connection-done">Done</button></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="renderer.js"></script>
+</body>
+</html>
