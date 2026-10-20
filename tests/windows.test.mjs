@@ -206,7 +206,9 @@ test('native Windows setup opens an interactive console and reports that console
   const scriptPath = path.join(directory, 'console.ps1');
   const resultPath = path.join(directory, 'console.txt');
   const releasePath = path.join(directory, 'release.txt');
-  await writeFile(scriptPath, '\ufeff' + `Set-Content -LiteralPath ${powerShellQuote(resultPath)} -Value ([Console]::IsInputRedirected.ToString())\r\nwhile (!(Test-Path -LiteralPath ${powerShellQuote(releasePath)})) { Start-Sleep -Milliseconds 100 }\r\nexit 23\r\n`, 'utf8');
+  // Production keeps -NoExit so setup output remains readable. End the test's
+  // native process explicitly; a script-level exit can leave that host open.
+  await writeFile(scriptPath, '\ufeff' + `Set-Content -LiteralPath ${powerShellQuote(resultPath)} -Value ([Console]::IsInputRedirected.ToString())\r\nwhile (!(Test-Path -LiteralPath ${powerShellQuote(releasePath)})) { Start-Sleep -Milliseconds 100 }\r\n[Environment]::Exit(23)\r\n`, 'utf8');
   const startedAt = Date.now();
   const terminal = await openSetupTerminal(scriptPath);
   let closed;
@@ -220,11 +222,15 @@ test('native Windows setup opens an interactive console and reports that console
     }
     assert.notEqual(inputRedirected, undefined, `PowerShell did not write its readiness file; closed=${JSON.stringify(closed)}, elapsed=${Date.now() - startedAt}ms`);
     assert.equal(inputRedirected.trim(), 'False', 'visible setup receives an interactive console, not the app\'s null stdin');
+    t.diagnostic(`Visible PowerShell is ready with interactive stdin after ${Date.now() - startedAt}ms.`);
     await delay(150);
     assert.equal(closed, undefined, `the launcher must wait until the visible console exits: ${JSON.stringify(closed)}`);
+    t.diagnostic('Bootstrap is still waiting while the visible console is open.');
   } finally {
     // Always release a successfully launched console, including after assertions.
     await writeFile(releasePath, 'release');
   }
-  assert.deepEqual(await terminal.closed, { exitCode: 23 });
+  const result = await terminal.closed;
+  t.diagnostic(`Visible console closed after release: ${JSON.stringify(result)}.`);
+  assert.deepEqual(result, { exitCode: 23 });
 });
