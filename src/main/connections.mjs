@@ -90,14 +90,18 @@ export async function openSetupTerminal(scriptPath, { platform = process.platfor
   ].join('\r\n');
   return new Promise((resolve, reject) => {
     const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(bootstrap, 'utf16le').toString('base64')], {
-      env: subscriptionEnvironment(env, platform), shell: false, detached: true, stdio: 'ignore', windowsHide: true,
+      env: subscriptionEnvironment(env, platform), shell: false, detached: true, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
     });
+    // Only the hidden launcher's errors are captured. The visible login console
+    // has its own output; neither login output nor this diagnostic is persisted.
+    let diagnostic = '';
+    child.stderr?.on('data', bytes => { diagnostic = (diagnostic + bytes.toString()).slice(-4096); });
     const closed = new Promise(resolveClosed => {
-      child.once('close', code => resolveClosed({ exitCode: Number.isInteger(code) ? code : 1 }));
+      child.once('close', code => resolveClosed({ exitCode: Number.isInteger(code) ? code : 1, ...(diagnostic.trim() ? { diagnostic: diagnostic.trim() } : {}) }));
       child.once('error', () => resolveClosed({ exitCode: 1 }));
     });
     child.once('error', reject);
-    child.once('spawn', () => { child.unref(); resolve({ closed }); });
+    child.once('spawn', () => { child.unref(); child.stderr?.unref?.(); resolve({ closed }); });
   });
 }
 

@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crossSpawn from 'cross-spawn';
@@ -203,8 +204,26 @@ test('native Windows setup opens an interactive console and reports that console
   t.after(() => rm(directory, { recursive: true, force: true }));
   const scriptPath = path.join(directory, 'console.ps1');
   const resultPath = path.join(directory, 'console.txt');
-  await writeFile(scriptPath, '\ufeff' + `Set-Content -LiteralPath ${powerShellQuote(resultPath)} -Value ([Console]::IsInputRedirected.ToString())\r\nexit 23\r\n`, 'utf8');
+  const releasePath = path.join(directory, 'release.txt');
+  await writeFile(scriptPath, '\ufeff' + `Set-Content -LiteralPath ${powerShellQuote(resultPath)} -Value ([Console]::IsInputRedirected.ToString())\r\nwhile (!(Test-Path -LiteralPath ${powerShellQuote(releasePath)})) { Start-Sleep -Milliseconds 100 }\r\nexit 23\r\n`, 'utf8');
+  const startedAt = Date.now();
   const terminal = await openSetupTerminal(scriptPath);
+  let closed;
+  terminal.closed.then(value => { closed = value; });
+  let inputRedirected;
+  try {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      inputRedirected = await readFile(resultPath, 'utf8').catch(() => undefined);
+      if (inputRedirected !== undefined || closed) break;
+      await delay(50);
+    }
+    assert.notEqual(inputRedirected, undefined, `PowerShell did not write its readiness file; closed=${JSON.stringify(closed)}, elapsed=${Date.now() - startedAt}ms`);
+    assert.equal(inputRedirected.trim(), 'False', 'visible setup receives an interactive console, not the app\'s null stdin');
+    await delay(150);
+    assert.equal(closed, undefined, `the launcher must wait until the visible console exits: ${JSON.stringify(closed)}`);
+  } finally {
+    // Always release a successfully launched console, including after assertions.
+    await writeFile(releasePath, 'release');
+  }
   assert.deepEqual(await terminal.closed, { exitCode: 23 });
-  assert.equal((await readFile(resultPath, 'utf8')).trim(), 'False', 'visible setup receives an interactive console, not the app\'s null stdin');
 });
