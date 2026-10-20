@@ -232,5 +232,7 @@ test('native Windows setup opens an interactive console and reports that console
   }
   const result = await terminal.closed;
   t.diagnostic(`Visible console closed after release: ${JSON.stringify(result)}.`);
-  assert.deepEqual(result, { exitCode: 23 });
+  // PowerShell can emit first-use module progress on stderr. Its optional
+  // diagnostic does not change the observed console exit status.
+  assert.equal(result.exitCode, 23, result.diagnostic || 'The visible console exit code must reach the app.');
 });
