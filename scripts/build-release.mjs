@@ -1,9 +1,21 @@
-import { build, Platform, Arch } from 'electron-builder';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDocumentReader } from './build-document-reader.mjs';
+
+// Missing GitHub secrets arrive as empty strings. electron-builder treats an
+// empty CSC_LINK as a certificate path relative to the working directory.
+// Preserve configured credentials, while making absent secrets truly absent.
+for (const name of [
+  'CSC_LINK', 'CSC_KEY_PASSWORD', 'CSC_NAME', 'CSC_INSTALLER_LINK', 'CSC_INSTALLER_KEY_PASSWORD',
+  'WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD',
+  'APPLE_ID', 'APPLE_APP_SPECIFIC_PASSWORD', 'APPLE_TEAM_ID',
+  'APPLE_API_KEY', 'APPLE_API_KEY_ID', 'APPLE_API_ISSUER',
+]) {
+  if (typeof process.env[name] === 'string' && process.env[name].trim() === '') delete process.env[name];
+}
+const { build, Platform, Arch } = await import('electron-builder');
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);

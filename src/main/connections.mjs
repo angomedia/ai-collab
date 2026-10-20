@@ -80,9 +80,9 @@ export async function openSetupTerminal(scriptPath, { platform = process.platfor
     return;
   }
   const executable = windowsSystemExecutable('WindowsPowerShell\\v1.0\\powershell.exe', env);
-  // libuv's detached Windows processes have no console. Start-Process explicitly
-  // creates a visible interactive console; its hidden bootstrap waits for it so
-  // closing that window can be detected even if no result marker was written.
+  // PowerShell can exit without executing under libuv's DETACHED_PROCESS flag.
+  // Keep this hidden bootstrap attached; Start-Process creates the separate
+  // visible console and waits for it so a missing completion marker is recoverable.
   const bootstrap = [
     "$ErrorActionPreference = 'Stop'",
     `$_aiCollabTerminal = Start-Process -FilePath ${powerShellQuote(executable)} -ArgumentList @('-NoLogo', '-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', ${powerShellQuote('"' + scriptPath + '"')}) -WindowStyle Normal -PassThru -Wait`,
@@ -90,7 +90,7 @@ export async function openSetupTerminal(scriptPath, { platform = process.platfor
   ].join('\r\n');
   return new Promise((resolve, reject) => {
     const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(bootstrap, 'utf16le').toString('base64')], {
-      env: subscriptionEnvironment(env, platform), shell: false, detached: true, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
+      env: subscriptionEnvironment(env, platform), shell: false, detached: false, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
     });
     // Only the hidden launcher's errors are captured. The visible login console
     // has its own output; neither login output nor this diagnostic is persisted.

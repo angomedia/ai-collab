@@ -140,6 +140,7 @@ test('Windows setup explicitly opens a visible console and observes its lifetime
   assert.ok(script.includes("'-File', " + powerShellQuote('"' + file + '"')));
   assert.match(script, /Start-Process.*-WindowStyle Normal -PassThru -Wait/);
   assert.equal(calls[0].options.shell, false); assert.equal(calls[0].options.windowsHide, true);
+  assert.equal(calls[0].options.detached, false, 'PowerShell must execute before it can start the visible console');
   assert.equal(calls[0].options.env.OPENAI_API_KEY, undefined);
   let closed = false; terminal.closed.then(() => { closed = true; }); await Promise.resolve(); assert.equal(closed, false);
   process.emit('close', 7); assert.deepEqual(await terminal.closed, { exitCode: 7 });

@@ -1,7 +1,7 @@
 {
   "name": "ai-collab",
   "productName": "AI Collab",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "A local desktop room for Codex and Claude Code to work through a goal together.",
   "private": true,
   "license": "MIT",
