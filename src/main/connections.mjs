@@ -64,6 +64,7 @@ export function buildPowerShellSetupScript({ provider, action, binary, resultPat
     "  Write-Host 'Sign-in finished. Return to AI Collab; its connection status will update automatically.'",
     '} catch {',
     "  Write-Host 'Setup did not finish. Check the messages above, then return to AI Collab and try again.' -ForegroundColor Red",
+    "  Write-Host ('Setup detail: ' + $_.Exception.Message) -ForegroundColor Red",
     '} finally {',
     '  if ($_aiCollabInstaller) { Remove-Item -LiteralPath $_aiCollabInstaller -Force -ErrorAction SilentlyContinue }',
     "  Set-Content -LiteralPath ($_aiCollabResult + '.tmp') -Value ([string]$_aiCollabExit) -Encoding ASCII",
@@ -78,12 +79,25 @@ export async function openSetupTerminal(scriptPath, { platform = process.platfor
     await executeFile('/usr/bin/open', ['-a', 'Terminal', scriptPath], { env: subscriptionEnvironment(env, platform), timeout: 12000, maxBuffer: 8192 });
     return;
   }
-  await new Promise((resolve, reject) => {
-    const child = spawn(windowsSystemExecutable('WindowsPowerShell\\v1.0\\powershell.exe', env), ['-NoLogo', '-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
-      env: subscriptionEnvironment(env, platform), shell: false, detached: true, stdio: 'ignore', windowsHide: false,
+  const executable = windowsSystemExecutable('WindowsPowerShell\\v1.0\\powershell.exe', env);
+  // libuv's detached Windows processes have no console. Start-Process explicitly
+  // creates a visible interactive console; its hidden bootstrap waits for it so
+  // closing that window can be detected even if no result marker was written.
+  const bootstrap = [
+    "$ErrorActionPreference = 'Stop'",
+    `$_aiCollabTerminal = Start-Process -FilePath ${powerShellQuote(executable)} -ArgumentList @('-NoLogo', '-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', ${powerShellQuote('"' + scriptPath + '"')}) -WindowStyle Normal -PassThru -Wait`,
+    'exit $_aiCollabTerminal.ExitCode',
+  ].join('\r\n');
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(bootstrap, 'utf16le').toString('base64')], {
+      env: subscriptionEnvironment(env, platform), shell: false, detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    const closed = new Promise(resolveClosed => {
+      child.once('close', code => resolveClosed({ exitCode: Number.isInteger(code) ? code : 1 }));
+      child.once('error', () => resolveClosed({ exitCode: 1 }));
     });
     child.once('error', reject);
-    child.once('spawn', () => { child.unref(); resolve(); });
+    child.once('spawn', () => { child.unref(); resolve({ closed }); });
   });
 }
 
@@ -202,20 +216,27 @@ export function createConnectionManager({
       await writeFile(scriptPath, script, { mode: 0o700 });
       const previous = getConfiguredPaths();
       if (action === 'install') await savePaths({ ...configured, [provider]: binary });
-      try { await openTerminal(scriptPath); }
+      const operation = { resultPath, terminalClosed: false };
+      try {
+        const terminal = await openTerminal(scriptPath);
+        if (platform === 'win32' && terminal?.closed?.then) {
+          Promise.resolve(terminal.closed).then(() => { operation.terminalClosed = true; }, () => { operation.terminalClosed = true; });
+        }
+      }
       catch {
         if (action === 'install') await savePaths(previous);
         throw new Error(`${terminalName} could not be opened. Open ${terminalName} and install or sign in to the CLI, then refresh connections.`);
       }
-      operations.set(operationId, resultPath);
+      operations.set(operationId, operation);
       return { provider, action, operationId, started: true, message: action === 'install'
         ? `Continue the official ${LABELS[provider]} installation and sign-in in ${terminalName}.`
         : `Complete ${LABELS[provider]} sign-in in ${terminalName} and your browser.` };
     });
   }
   async function getSetupResult(operationId) {
-    const resultPath = operations.get(operationId);
-    if (!resultPath) throw new Error('Unknown setup operation.');
+    const operation = operations.get(operationId);
+    if (!operation) throw new Error('Unknown setup operation.');
+    const { resultPath } = operation;
     try {
       const metadata = await stat(resultPath);
       if (!metadata.isFile() || metadata.size > 16) throw new Error('Invalid setup result.');
@@ -223,7 +244,7 @@ export function createConnectionManager({
       if (!/^\d{1,3}$/.test(value) || Number(value) > 255) throw new Error('Invalid setup result.');
       return { complete: true, exitCode: Number(value) };
     } catch (error) {
-      if (error.code === 'ENOENT') return { complete: false };
+      if (error.code === 'ENOENT') return operation.terminalClosed ? { complete: true, exitCode: 1 } : { complete: false };
       throw new Error('Setup finished without a readable completion status. Refresh connections to check the sign-in.');
     }
   }

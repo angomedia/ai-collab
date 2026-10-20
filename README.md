@@ -18,7 +18,7 @@ Open the latest release and expand **Assets**. Choose the installer for your com
 
 On a Mac, **Apple menu → About This Mac** identifies your chip or processor. Mac ZIP downloads are also provided. Windows ARM and Linux installers are not included in this release.
 
-Requirements: **macOS 13 or later**, or **Windows 10 1809 or later / Windows 11 (x64)**; an internet connection; and your own accounts with access to Codex and Claude Code. Model availability and usage limits depend on your accounts. You do not need Node.js or a developer environment to run the installed app. See [Claude Code's system requirements](https://code.claude.com/docs/en/setup#system-requirements).
+Requirements: **macOS 13 or later**, or **Windows 10 1809 or later / Windows 11 (x64)**; an internet connection; and your own accounts with access to Codex and Claude Code (2.1.259 or later). Model availability and usage limits depend on your accounts. You do not need Node.js or a developer environment to run the installed app. See [Claude Code's system requirements](https://code.claude.com/docs/en/setup#system-requirements).
 
 ### First-launch security prompts
 

@@ -19,11 +19,12 @@ const results = await packager({
   arch: process.arch,
   out: path.join(root, 'dist'),
   overwrite: true,
-  asar: true,
+  asar: { unpack: '**/*.node' },
   extraResource: helper ? [helper] : [],
   prune: true,
   ...(process.platform === 'darwin' && existsSync(icon) ? { icon } : {}),
-  ignore: [/^\/dist(?:\/|$)/, /^\/tests(?:\/|$)/, /^\/test-results(?:\/|$)/, /^\/outputs(?:\/|$)/, /^\/scripts(?:\/|$)/, /^\/resources(?:\/|$)/, /^\/\.git(?:hub)?(?:\/|$)/],
+  ignore: [/^\/dist(?:\/|$)/, /^\/tests(?:\/|$)/, /^\/test-results(?:\/|$)/, /^\/outputs(?:\/|$)/, /^\/scripts(?:\/|$)/, /^\/resources(?:\/|$)/, /^\/\.git(?:hub)?(?:\/|$)/,
+    /^\/node_modules\/@anthropic-ai\/claude-agent-sdk-[^/]+(?:\/|$)/],
   extendInfo: { NSHumanReadableCopyright: 'AI Collab contributors', LSMinimumSystemVersion: '13.0' },
 });
 for (const result of results) console.log(path.join(result, process.platform === 'darwin' ? 'AI Collab.app' : 'AI Collab.exe'));

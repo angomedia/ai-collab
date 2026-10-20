@@ -37,7 +37,7 @@ npm run dist -- --win --x64
 
 Run only the command matching the machine. Cross-building is deliberately rejected because native PDF dependencies must match the packaged Electron runtime. macOS builds need the Xcode command-line tools for the native Swift document reader. Output is under `dist/release/`.
 
-`npm run package` builds an unpacked application under `dist/`, useful for local testing. `npm run test:release` checks the electron-builder app from `dist/release/` without signing into providers. It uses a separate temporary profile and checks startup, defaults, and real document imports.
+`npm run package` builds an unpacked application under `dist/`, useful for local testing. `npm run test:release` checks the electron-builder app from `dist/release/` without signing into providers. It uses a separate temporary profile and checks startup, defaults, and real document imports. `npm run test:installers` checks the actual mounted DMG and extracted ZIP on Mac; on Windows it installs, checks, and uninstalls NSIS in a disposable GitHub Actions runner. The Windows installer test refuses to run against a local developer profile.
 
 ## Publish from GitHub Actions
 
@@ -51,7 +51,7 @@ The **Release installers** workflow runs on version tags and can also be started
 | `macos-15-intel` | macOS x64 |
 | `windows-2025` | Windows x64 |
 
-Every release job runs unit tests, the GUI test, and a packaged-app smoke test. After all three jobs pass, a tag-triggered workflow checks the complete artifact set and checksums, then creates a **draft release**. Manual workflow runs upload build artifacts without creating a release.
+Every release job runs unit tests, the GUI test, and smoke tests against the actual installer artifacts (including Windows install and uninstall). After all three jobs pass, a tag-triggered workflow checks the complete artifact set and checksums, then creates a **draft release**. Manual workflow runs upload build artifacts without creating a release.
 
 To publish a new version:
 

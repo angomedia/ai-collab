@@ -35,7 +35,12 @@ await build({
     productName: 'AI Collab',
     copyright: 'Copyright © Ango Media',
     directories: { output, buildResources: path.join(root, 'assets') },
-    files: ['src/**/*', 'assets/icon.png', 'package.json', 'LICENSE', 'README.md'],
+    files: [
+      'src/**/*', 'assets/icon.png', 'package.json', 'LICENSE', 'README.md',
+      // The app always passes the user's installed Claude Code to the SDK.
+      // Its optional CLI binaries are not a second managed installation.
+      '!node_modules/@anthropic-ai/claude-agent-sdk-*/**/*',
+    ],
     asar: true,
     asarUnpack: ['**/*.node'],
     npmRebuild: false,

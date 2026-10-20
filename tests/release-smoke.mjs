@@ -63,6 +63,9 @@ try {
   // Exercise the bundled portable worker even on macOS; its asar/PDF.js path is
   // independent of the native PDFKit branch used by this platform's normal UI.
   const applicationPath = await desktop.evaluate(({ app }) => app.getAppPath());
+  const anthropicPackages = await desktop.evaluate((_, location) => process.getBuiltinModule('node:fs').readdirSync(location), path.join(applicationPath, 'node_modules', '@anthropic-ai'));
+  assert.ok(anthropicPackages.includes('claude-agent-sdk'), 'the SDK bridge is packaged');
+  assert.deepEqual(anthropicPackages.filter(name => name.startsWith('claude-agent-sdk-')), [], 'optional second Claude CLI installations are excluded');
   const portable = await desktop.evaluate(async (_, input) => {
     const require = process.getBuiltinModule('node:module').createRequire(input.modulePath);
     const { AttachmentStore } = require(input.modulePath);

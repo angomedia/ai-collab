@@ -21,6 +21,7 @@
     "package": "node scripts/package.mjs",
     "dist": "node scripts/build-release.mjs",
     "test:release": "node tests/release-smoke.mjs",
+    "test:installers": "node scripts/test-installers.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
   "devDependencies": {

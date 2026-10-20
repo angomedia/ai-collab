@@ -10,7 +10,7 @@ import path from 'node:path';
 import crossSpawn from 'cross-spawn';
 import { createCliAdapter, subscriptionEnvironment } from '../src/main/cli.mjs';
 import { createModelDiscovery } from '../src/main/models.mjs';
-import { buildPowerShellSetupScript, openSetupTerminal, powerShellQuote } from '../src/main/connections.mjs';
+import { buildPowerShellSetupScript, createConnectionManager, openSetupTerminal, powerShellQuote } from '../src/main/connections.mjs';
 import { terminateProcessTree, windowsSystemExecutable } from '../src/main/processes.mjs';
 
 function child(pid = 73123) {
@@ -126,16 +126,41 @@ test('PowerShell setup quotes selected paths, uses only official installers and 
   }
 });
 
-test('Windows setup launches a visible independent PowerShell with a literal -File argument', async () => {
+test('Windows setup explicitly opens a visible console and observes its lifetime without interpolating paths', async () => {
   const calls = [];
   const file = "C:\\A User's folder & text\\setup.ps1";
-  await openSetupTerminal(file, { platform: 'win32', env: { OPENAI_API_KEY: 'secret', SystemRoot: 'C:\\Windows' }, spawn(binary, args, options) {
-    calls.push({ binary, args, options }); const process = child(); queueMicrotask(() => process.emit('spawn')); return process;
+  let process;
+  const terminal = await openSetupTerminal(file, { platform: 'win32', env: { OPENAI_API_KEY: 'secret', SystemRoot: 'C:\\Windows' }, spawn(binary, args, options) {
+    calls.push({ binary, args, options }); process = child(); queueMicrotask(() => process.emit('spawn')); return process;
   } });
   assert.match(calls[0].binary, /WindowsPowerShell\\v1.0\\powershell.exe$/);
-  assert.deepEqual(calls[0].args.slice(-2), ['-File', file]);
-  assert.equal(calls[0].options.shell, false); assert.equal(calls[0].options.windowsHide, false);
+  assert.equal(calls[0].args.at(-2), '-EncodedCommand');
+  const script = Buffer.from(calls[0].args.at(-1), 'base64').toString('utf16le');
+  assert.ok(script.includes("'-File', " + powerShellQuote('"' + file + '"')));
+  assert.match(script, /Start-Process.*-WindowStyle Normal -PassThru -Wait/);
+  assert.equal(calls[0].options.shell, false); assert.equal(calls[0].options.windowsHide, true);
   assert.equal(calls[0].options.env.OPENAI_API_KEY, undefined);
+  let closed = false; terminal.closed.then(() => { closed = true; }); await Promise.resolve(); assert.equal(closed, false);
+  process.emit('close', 7); assert.deepEqual(await terminal.closed, { exitCode: 7 });
+});
+
+test('a closed Windows setup window without a marker is a retryable failure; a written result takes precedence', async t => {
+  const userData = await mkdtemp(path.join(os.tmpdir(), 'ai-collab-setup-close-'));
+  t.after(() => rm(userData, { recursive: true, force: true }));
+  const opened = [];
+  const manager = createConnectionManager({ userData, platform: 'win32', home,
+    configureProviderPaths() {}, discoverProviders: async () => ({ codex: { path: 'C:\\CLI\\codex.exe' } }),
+    openTerminal: async script => { let close; const closed = new Promise(resolve => { close = resolve; }); opened.push({ script, close }); return { closed }; },
+  });
+  await manager.init();
+  const first = await manager.setupProvider('codex', 'login');
+  assert.deepEqual(await manager.getSetupResult(first.operationId), { complete: false });
+  opened[0].close({ exitCode: 0 }); await Promise.resolve();
+  assert.deepEqual(await manager.getSetupResult(first.operationId), { complete: true, exitCode: 1 }, 'even exit zero is not proof that sign-in completed');
+  const second = await manager.setupProvider('codex', 'login');
+  await writeFile(path.join(userData, 'setup', `${second.operationId}.result`), '0\n');
+  opened[1].close({ exitCode: 1 }); await Promise.resolve();
+  assert.deepEqual(await manager.getSetupResult(second.operationId), { complete: true, exitCode: 0 });
 });
 
 test('native Windows cmd launchers preserve literal arguments, empty tools and UTF-8 stdin', { skip: process.platform !== 'win32' }, async t => {
@@ -171,4 +196,15 @@ test('native PowerShell setup stops failed installers and logs in only after suc
     if (code !== 0) await assert.rejects(readFile(record), { code: 'ENOENT' });
     else assert.equal((await readFile(record, 'utf8')).trim(), 'login');
   }
+});
+
+test('native Windows setup opens an interactive console and reports that console closing', { skip: process.platform !== 'win32', timeout: 20000 }, async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ai-collab O'Brien console "));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scriptPath = path.join(directory, 'console.ps1');
+  const resultPath = path.join(directory, 'console.txt');
+  await writeFile(scriptPath, '\ufeff' + `Set-Content -LiteralPath ${powerShellQuote(resultPath)} -Value ([Console]::IsInputRedirected.ToString())\r\nexit 23\r\n`, 'utf8');
+  const terminal = await openSetupTerminal(scriptPath);
+  assert.deepEqual(await terminal.closed, { exitCode: 23 });
+  assert.equal((await readFile(resultPath, 'utf8')).trim(), 'False', 'visible setup receives an interactive console, not the app\'s null stdin');
 });
