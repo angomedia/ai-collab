@@ -41,16 +41,18 @@ function safeDiagnostic(value) {
     .slice(-2000).trim();
 }
 
-export function providerArguments(provider, model, { outputSchemaPath } = {}) {
+// webSearch enables only each provider's hosted search tool; every other tool stays disabled.
+export function providerArguments(provider, model, { outputSchemaPath, webSearch = false } = {}) {
   let args;
   if (provider === 'codex') {
-    args = ['--no-daemon', '--ask-for-approval', 'never', 'exec', '--json', '--color', 'never', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral', '-c', 'web_search="disabled"', '-c', 'project_doc_max_bytes=0'];
+    args = ['--no-daemon', '--ask-for-approval', 'never', 'exec', '--json', '--color', 'never', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral', '-c', `web_search="${webSearch ? 'live' : 'disabled'}"`, '-c', 'project_doc_max_bytes=0'];
     for (const feature of ['shell_tool', 'unified_exec', 'shell_snapshot', 'apps', 'plugins', 'hooks', 'multi_agent', 'computer_use', 'browser_use', 'image_generation', 'view_image']) args.push('--disable', feature);
     if (model) args.push('--model', model);
     if (outputSchemaPath) args.push('--output-schema', outputSchemaPath);
     args.push('-');
   } else if (provider === 'claude') {
-    args = ['--print', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--safe-mode', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--no-session-persistence', '--disable-slash-commands', '--no-chrome'];
+    args = ['--print', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--safe-mode', '--tools', webSearch ? 'WebSearch' : '', '--strict-mcp-config', '--permission-prompts', 'none', '--no-session-persistence', '--disable-slash-commands', '--no-chrome'];
+    if (webSearch) args.push('--allowedTools', 'WebSearch');
     if (model) args.push('--model', model);
   } else throw new Error('Unknown provider.');
   return args;
@@ -295,12 +297,13 @@ export function createCliAdapter({ spawn = crossSpawn, terminateSpawn = nodeSpaw
     const [codex, claude] = await Promise.all(PROVIDERS.map((provider) => inspect(provider)));
     return { codex, claude };
   }
-  async function runProvider({ provider, prompt, cwd, model, outputSchema, timeoutMs = 300000, signal, onEvent = () => {} }) {
+  async function runProvider({ provider, prompt, cwd, model, outputSchema, webSearch = false, timeoutMs = 300000, signal, onEvent = () => {} }) {
     if (!PROVIDERS.includes(provider)) throw new Error('Unknown provider.');
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('Enter a goal before starting.');
     if (typeof cwd !== 'string' || !cwd) throw new Error('An isolated working directory is required.');
     if (model != null && (typeof model !== 'string' || model.length > 150 || /[\r\n\0]/.test(model))) throw new Error('Invalid model name.');
     if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new Error('Invalid response timeout.');
+    if (typeof webSearch !== 'boolean') throw new Error('Invalid web search setting.');
     let serializedSchema;
     if (outputSchema != null) {
       if (provider !== 'codex') throw new Error('Output schemas are currently supported for Codex calls only.');
@@ -320,9 +323,10 @@ export function createCliAdapter({ spawn = crossSpawn, terminateSpawn = nodeSpaw
         outputSchemaPath = join(schemaDirectory, 'response.schema.json');
         await writeFile(outputSchemaPath, serializedSchema, { mode: 0o600, flag: 'wx' });
       }
-      const parser = createOutputParser(provider, onEvent, { finalResponseOnly: Boolean(serializedSchema) });
+      // Searching produces progress messages before the final answer; only the final answer is kept.
+      const parser = createOutputParser(provider, onEvent, { finalResponseOnly: Boolean(serializedSchema) || webSearch });
       let nonJson = '';
-      const result = await execute(status.path, providerArguments(provider, model?.trim(), { outputSchemaPath }), {
+      const result = await execute(status.path, providerArguments(provider, model?.trim(), { outputSchemaPath, webSearch }), {
         cwd, input: prompt, timeoutMs, signal,
         onLine(line) {
           let event;

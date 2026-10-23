@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('council', Object.freeze({
   reuseAttachments: id => ipcRenderer.invoke('council:attachments-reuse', id),
   startRun: input => ipcRenderer.invoke('council:start', input),
   followUp: (id, input) => ipcRenderer.invoke('council:follow-up', id, input),
+  answerClarification: (id, input) => ipcRenderer.invoke('council:clarification-answer', id, input),
   stopRun: id => ipcRenderer.invoke('council:stop', id),
   exportRun: id => ipcRenderer.invoke('council:export', id),
   copyText: text => ipcRenderer.invoke('council:copy', text),

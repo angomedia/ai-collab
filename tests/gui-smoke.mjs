@@ -30,6 +30,16 @@ const refinedFollowup = 'Build a release checklist from the prior agreed prototy
 const initialRoles = { codex: 'Prototype scope advocate', claude: 'Retrieval evidence skeptic' };
 const followupRoles = { codex: 'Release readiness advocate', claude: 'Failure recovery reviewer' };
 const stopGoal = 'Explore a longer architecture discussion. [STOP TEST]';
+const researchTerm = 'RELEASE_LOOKUP_TERM_6604';
+const researchMarker = 'RESEARCH_BRIEF_MARKER_5530';
+const clarificationGoal = 'Help me choose a realistic family technology plan. [CLARIFICATION TEST]';
+const assumptionGoal = 'Help me choose a plan with information I cannot supply yet. [CLARIFICATION ASSUMPTIONS TEST]';
+const clarificationQuestions = [
+  { id: 'priority', question: 'What is your main priority for the plan?', options: ['Less screen time', 'More independence', 'A workable balance'] },
+  { id: 'budget', question: 'What budget can the household commit?', options: [] },
+  { id: 'timing', question: 'When should the trial begin?', options: ['This week', 'Next month', 'No fixed date'] },
+];
+const summaryHeadline = 'A realistic plan with a measurable goal';
 const errors = [];
 let desktop;
 let page;
@@ -79,17 +89,30 @@ let prompt = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { prompt += chunk; });
 process.stdin.on('end', () => {
-  const rawPhase = prompt.match(/PHASE:\\s*(PLANNING|PLAN|ADJUDICATION|JUDGE|ANALYSIS|CRITIQUE|SYNTHESIS|REVISION|REVIEW)/)?.[1];
+  const rawPhase = prompt.match(/PHASE:\\s*(SUMMARY|CLARIFICATION|KNOWLEDGE|RESEARCH|PLANNING|PLAN|ADJUDICATION|JUDGE|ANALYSIS|CRITIQUE|SYNTHESIS|REVISION|REVIEW)/)?.[1];
   const phase = ({PLANNING: 'PLAN', ADJUDICATION: 'JUDGE'})[rawPhase] || rawPhase;
   const version = Number(prompt.match(/CANDIDATE_VERSION:\\s*(\\d+)/)?.[1] || 1);
   const turn = Number(prompt.match(/TURN_NUMBER:\\s*(\\d+)/)?.[1] || 1);
   const model = args.includes('--model') ? args[args.indexOf('--model') + 1] : '';
   const callId = provider + '-' + process.pid;
-  fs.appendFileSync(process.env.AI_COLLAB_TEST_CALLS, JSON.stringify({event: 'start', callId, provider, phase, rawPhase, version, turn, model, prompt}) + '\\n');
+  const webSearch = args.includes('web_search="live"') || args.includes('WebSearch');
+  fs.appendFileSync(process.env.AI_COLLAB_TEST_CALLS, JSON.stringify({event: 'start', callId, provider, phase, rawPhase, version, turn, model, webSearch, outputSchema: args.includes('--output-schema'), prompt}) + '\\n');
   const logEnd = () => fs.appendFileSync(process.env.AI_COLLAB_TEST_CALLS, JSON.stringify({event: 'end', callId}) + '\\n');
   process.on('SIGTERM', () => { logEnd(); process.exit(0); });
   let text;
-  if (phase === 'PLAN') {
+  if (phase === 'SUMMARY') text = JSON.stringify({headline: ${JSON.stringify(summaryHeadline)}, points: ['Keep the initial scope on one device.', 'Validate retrieval with at least four of five people.']});
+  else if (phase === 'CLARIFICATION') {
+    const needed = /\\[CLARIFICATION(?: ASSUMPTIONS)? TEST\\]/.test(prompt);
+    text = JSON.stringify({needsClarification: needed,
+      reason: needed ? 'The recommendation depends on the household priorities, budget, and timing.' : 'The question supplies enough context.',
+      questions: needed ? ${JSON.stringify(clarificationQuestions)} : []});
+  }
+  // Only Claude lacks knowledge, and only for the follow-up question.
+  else if (phase === 'KNOWLEDGE') text = JSON.stringify(turn > 1 && provider === 'claude'
+    ? {needsResearch: true, unfamiliar: [${JSON.stringify(researchTerm)}], queries: ['software release checklist practices']}
+    : {needsResearch: false, unfamiliar: [], queries: []});
+  else if (phase === 'RESEARCH') text = '## Release checklist practices\\n\\n' + ${JSON.stringify(researchMarker)} + ': teams verify backups before release.\\n\\nSources: [Release practices](https://example.com/release-practices)';
+  else if (phase === 'PLAN') {
     const labels = turn === 1 ? ${JSON.stringify(initialRoles)} : ${JSON.stringify(followupRoles)};
     text = JSON.stringify({refinedQuestion: turn === 1 ? ${JSON.stringify(refinedInitial)} : ${JSON.stringify(refinedFollowup)},
       mode: turn === 1 ? 'opposing' : 'complementary',
@@ -199,11 +222,11 @@ async function checkNarrowLayout(filename) {
     viewportWidth: innerWidth,
     panelWidth: document.querySelector('.main-panel').clientWidth,
     panelScrollWidth: document.querySelector('.main-panel').scrollWidth,
-    composerVisible: document.querySelector('#goal').getBoundingClientRect().bottom <= innerHeight,
+    composerVisible: document.querySelector('#goal-form').getBoundingClientRect().bottom <= innerHeight,
   }));
   assert.ok(dimensions.documentWidth <= dimensions.viewportWidth, `page overflow: ${JSON.stringify(dimensions)}`);
   assert.ok(dimensions.panelScrollWidth <= dimensions.panelWidth + 1, `main panel overflow: ${JSON.stringify(dimensions)}`);
-  assert.ok(dimensions.composerVisible, 'the question composer stays accessible at the minimum window size');
+  assert.ok(dimensions.composerVisible, 'the composer and context controls stay accessible at the minimum window size');
   await page.screenshot({ path: path.join(resultsDir, filename) });
   await page.setViewportSize({ width: 1320, height: 880 });
 }
@@ -235,6 +258,116 @@ async function closeConnectionsWithEscape() {
   await page.keyboard.press('Escape');
   await page.locator('#connections-dialog').waitFor({ state: 'hidden' });
   await page.waitForFunction(() => document.activeElement?.id === 'open-connections');
+}
+
+async function testClarificationUi(env) {
+  const readCalls = async goal => (await readFile(callLogPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    .filter(call => call.event === 'start' && call.phase !== 'SUMMARY' && call.prompt.includes(goal));
+  const pendingPanel = () => page.locator('.clarification-panel[data-clarification-id]');
+  async function begin(goal) {
+    await page.locator('#new-chat').click();
+    await page.locator('#goal').fill(goal);
+    await page.locator('#settings-toggle').click();
+    await page.locator('#codex-model').selectOption('codex-test');
+    await page.locator('#claude-model').selectOption('claude-test');
+    await page.locator('#moderator-model').selectOption('gpt-6-sol');
+    await page.locator('#close-settings').click();
+    await desktop.evaluate(({ dialog }, files) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: files }); }, [csvPath]);
+    await page.locator('#attach-files').click();
+    await expectAttachments(1);
+    await page.locator('#start-debate').click();
+    const run = await waitForChat(goal, 'awaiting_input');
+    await pendingPanel().waitFor();
+    assert.equal(await page.locator('#debate-progress .progress-step[data-step="clarify"]').isVisible(), true, 'the active clarification step is represented in the progress strip');
+    assert.equal(run.clarification.status, 'pending');
+    assert.equal(run.turns[0].status, 'awaiting_input');
+    assert.equal(run.final, null);
+    assert.equal(await page.locator('#thread .final-message:visible').count(), 0, 'asking for information is not a final answer');
+    assert.equal(await pendingPanel().locator('.clarification-question').count(), 3);
+    assert.deepEqual(run.clarification.questions, clarificationQuestions);
+    assert.deepEqual((await readCalls(goal)).map(call => call.phase), ['CLARIFICATION'], 'neither knowledge checks nor a debate starts before the person responds');
+    assert.ok(!run.messages.some(message => ['analysis', 'critique', 'candidate', 'planning'].includes(message.kind)));
+    assert.equal(await pendingPanel().locator('.clarification-continue').isDisabled(), true, 'empty answers cannot be submitted');
+    return run;
+  }
+
+  const first = await begin(clarificationGoal);
+  await pendingPanel().evaluate(element => element.scrollIntoView({ block: 'start' }));
+  await page.screenshot({ path: path.join(resultsDir, 'gui-clarification.png') });
+  await checkNarrowLayout('gui-clarification-narrow.png');
+
+  // Persist the waiting state across a real app restart. No inference is replayed.
+  await desktop.close();
+  await launchDesktop(env);
+  await waitForText('#provider-codex', 'Connected');
+  await page.locator('#chat-list button').filter({ hasText: clarificationGoal }).click();
+  await pendingPanel().waitFor();
+  const restored = await waitForChat(clarificationGoal, 'awaiting_input');
+  assert.equal(restored.id, first.id);
+  assert.equal(restored.clarification.id, first.clarification.id);
+  assert.equal(restored.turns.length, 1);
+  assert.equal(await page.locator('#source-list .source-chip').count(), 1, 'the waiting question retains its uploaded source after restart');
+  assert.equal(await page.locator('#attach-files').isDisabled(), true, 'waiting sources cannot be changed underneath the paused question');
+  assert.deepEqual((await readCalls(clarificationGoal)).map(call => call.phase), ['CLARIFICATION']);
+
+  const blankAttempt = await page.evaluate(async ({ runId, clarificationId, questions }) => {
+    try {
+      await window.council.answerClarification(runId, { clarificationId, answers: questions.map(question => ({ id: question.id, answer: '   ' })) });
+      return { accepted: true };
+    } catch (error) { return { accepted: false, error: error.message }; }
+  }, { runId: first.id, clarificationId: first.clarification.id, questions: clarificationQuestions });
+  assert.equal(blankAttempt.accepted, false, 'the backend independently rejects blank answers');
+  assert.match(blankAttempt.error, /answer|complete|empty|required/i);
+  assert.equal((await waitForChat(clarificationGoal, 'awaiting_input')).clarification.status, 'pending');
+  assert.equal((await readCalls(clarificationGoal)).length, 1, 'rejected answers never start inference');
+
+  const answerTexts = ['A workable balance', 'CLARIFIED_BUDGET_9241: up to $30 each month.', 'CLARIFIED_TIMING_6152: begin after the school holiday.'];
+  const priorityOption = pendingPanel().locator('.clarification-question[data-question-id="priority"] .clarification-option').filter({ hasText: answerTexts[0] });
+  await priorityOption.click();
+  assert.equal(await priorityOption.getAttribute('aria-pressed'), 'true');
+  const budget = pendingPanel().locator('.clarification-question[data-question-id="budget"] .clarification-answer');
+  await budget.fill(answerTexts[1]);
+  await budget.focus();
+  await page.evaluate(() => window.council.refreshProviders());
+  assert.equal(await budget.inputValue(), answerTexts[1], 'provider/status snapshots preserve typed clarification answers');
+  assert.ok(await budget.evaluate(element => document.activeElement === element), 'status updates preserve answer focus');
+  await pendingPanel().locator('.clarification-question[data-question-id="timing"] .clarification-answer').fill(answerTexts[2]);
+  assert.equal(await pendingPanel().locator('.clarification-continue').isEnabled(), true);
+  await page.screenshot({ path: path.join(resultsDir, 'gui-clarification-answered.png') });
+  await pendingPanel().locator('.clarification-continue').click();
+  const answered = await waitForChat(clarificationGoal, 'completed');
+  assert.equal(answered.id, first.id, 'answering resumes the same conversation');
+  assert.equal(answered.turns.length, 1, 'answering resumes the same question, without a new turn');
+  assert.equal(answered.clarification.status, 'answered');
+  assert.deepEqual(answered.clarification.answers, clarificationQuestions.map((question, index) => ({ id: question.id, answer: answerTexts[index] })));
+  assert.ok(answered.messages.some(message => message.provider === 'user' && message.kind === 'clarification_answer'));
+  const answeredCalls = await readCalls(clarificationGoal);
+  assert.equal(answeredCalls.filter(call => call.phase === 'CLARIFICATION').length, 1, 'resuming does not ask the same preflight questions again');
+  for (const call of answeredCalls.filter(call => call.phase !== 'CLARIFICATION')) {
+    for (const answer of answerTexts) assert.ok(call.prompt.includes(answer), `${call.provider} ${call.phase} receives the exact clarification answer`);
+    assert.ok(call.prompt.includes(sourceMarker), 'resuming retains the uploaded source');
+  }
+  assert.equal(answered.final.decided, true);
+  const clarifiedExport = path.join(temporary, 'clarified-debate.md');
+  await desktop.evaluate(({ dialog }, destination) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath: destination }); }, clarifiedExport);
+  await page.locator('#export-run').click();
+  await waitForText('#toast', 'Chat exported');
+  const exported = await readFile(clarifiedExport, 'utf8');
+  for (const answer of answerTexts) assert.ok(exported.includes(answer), 'export preserves the person\'s answers');
+
+  await begin(assumptionGoal);
+  await pendingPanel().locator('.clarification-assumptions').click();
+  const assumed = await waitForChat(assumptionGoal, 'completed');
+  assert.equal(assumed.clarification.status, 'assumptions');
+  assert.deepEqual(assumed.clarification.answers, []);
+  const assumptionCalls = await readCalls(assumptionGoal);
+  assert.equal(assumptionCalls.filter(call => call.phase === 'CLARIFICATION').length, 1);
+  for (const call of assumptionCalls.filter(call => call.phase !== 'CLARIFICATION')) {
+    assert.match(call.prompt, /explicitly chose to continue with assumptions/, `${call.phase} must distinguish authorized assumptions from supplied facts`);
+  }
+  assert.equal(assumed.final.decided, true);
+  await page.locator('#chat-scroll').evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await page.screenshot({ path: path.join(resultsDir, 'gui-clarification-assumptions.png') });
 }
 
 async function testSavedDefaults(env) {
@@ -719,6 +852,13 @@ try {
   assert.equal(initial.messages[0].kind, 'planning');
   assert.equal(initial.messages[0].provider, 'moderator');
   assert.equal(initial.turns[0].plan.refinedQuestion, refinedInitial);
+  const openingResponse = page.locator('#thread .assistant-message[data-provider="codex"]').first();
+  await openingResponse.locator('.message-summary').filter({ hasText: summaryHeadline }).waitFor();
+  const originalResponse = openingResponse.locator('details.full-response');
+  assert.equal(await originalResponse.getAttribute('open'), null, 'the short generated summary is the default reading view');
+  await originalResponse.locator('summary').click();
+  assert.ok((await originalResponse.innerText()).includes('five people can save and find a note without help'), 'Full response retains the original provider text');
+  await originalResponse.locator('summary').click();
   for (const provider of ['codex', 'claude']) {
     assert.equal(initial.turns[0].plan.roles[provider].label, initialRoles[provider]);
     await waitForText(`#thread .assistant-message[data-provider="${provider}"] .message-perspective`, initialRoles[provider]);
@@ -737,6 +877,18 @@ try {
   const originalMessageIds = initial.messages.map(message => message.id);
   await page.screenshot({ path: path.join(resultsDir, 'gui-final.png') });
   await checkNarrowLayout('gui-final-narrow.png');
+  await page.locator('#thread .assistant-message[data-kind="analysis"]').first().evaluate(element => element.scrollIntoView({ block: 'start' }));
+  await page.screenshot({ path: path.join(resultsDir, 'gui-opening-discussion.png') });
+  const pairedReviews = page.locator('#thread .review-comparison[data-version="4"]');
+  assert.equal(await pairedReviews.locator('.review-side').count(), 2, 'each reviewed draft has one comparison column per provider');
+  for (const provider of ['codex', 'claude']) {
+    assert.equal(await pairedReviews.locator(`.review-side[data-provider="${provider}"] .review-current .assistant-message`).count(), 1, 'the comparison has one current review for each provider');
+  }
+  await pairedReviews.evaluate(element => element.scrollIntoView({ block: 'center' }));
+  await page.screenshot({ path: path.join(resultsDir, 'gui-paired-reviews.png') });
+  await checkNarrowLayout('gui-paired-reviews-narrow.png');
+  await page.locator('#thread .final-message').last().scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(resultsDir, 'gui-completed-multi-round.png') });
 
   // Continue the existing conversation, keeping prior answers, sources, models, and history identity.
   await page.locator('#goal').fill(followupGoal);
@@ -768,6 +920,16 @@ try {
   for (const provider of ['codex', 'claude']) assert.equal(followed.turns[1].plan.roles[provider].label, followupRoles[provider]);
   assert.equal(followed.final.version, 4);
   assert.deepEqual(followed.messages.slice(0, originalMessageIds.length).map(message => message.id), originalMessageIds);
+  const research = followed.messages.filter(message => message.kind === 'research');
+  assert.equal(research.length, 1); assert.equal(research[0].provider, 'claude'); assert.equal(research[0].turnId, followed.turns[1].id);
+  assert.deepEqual(research[0].lookup, [researchTerm]);
+  assert.ok(!followed.messages.some(message => message.kind === 'knowledge'), 'knowledge checks stay out of the transcript');
+  const researchCard = page.locator('#thread .assistant-message[data-provider="claude"]').filter({ hasText: researchMarker });
+  assert.equal(await researchCard.count(), 1);
+  assert.ok((await researchCard.locator('.message-label').innerText()).includes('Web research'));
+  assert.equal(await researchCard.locator('.message-perspective').innerText(), `Looking up: ${researchTerm}`);
+  assert.equal(await researchCard.locator('a[href="https://example.com/release-practices"]').count(), 1, 'research sources are clickable links');
+  await researchCard.screenshot({ path: path.join(resultsDir, 'gui-research.png') });
   assert.equal(await page.locator('#chat-list button').count(), 1, 'a followup keeps the same chat history entry');
   assert.equal(await page.locator('#thread .user-message').count(), 2);
   assert.equal(await page.locator('#thread .final-message').count(), 2);
@@ -792,7 +954,7 @@ try {
   await page.locator('#export-run').click();
   await waitForText('#toast', 'Chat exported');
   const exported = await readFile(exportPath, 'utf8');
-  for (const value of [initialGoal, followupGoal, refinedInitial, refinedFollowup, ...Object.values(initialRoles), ...Object.values(followupRoles), priorFinalMarker, followupAnswerMarker, csvName, textName, 'codex-test', 'claude-test', 'gpt-6-sol', 'Claude still prefers']) {
+  for (const value of [initialGoal, followupGoal, refinedInitial, refinedFollowup, ...Object.values(initialRoles), ...Object.values(followupRoles), priorFinalMarker, followupAnswerMarker, csvName, textName, 'codex-test', 'claude-test', 'gpt-6-sol', 'Claude still prefers', researchMarker, `Looked up: ${researchTerm}`]) {
     assert.ok(exported.includes(value), `export retains ${value}`);
   }
   assert.ok(!exported.includes('"candidate_version"'), 'exports contain readable reviews');
@@ -874,11 +1036,20 @@ try {
   await page.locator('#close-source-preview').click();
 
   const lifecycle = (await readFile(callLogPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  const calls = lifecycle.filter(event => event.event === 'start');
+  const calls = lifecycle.filter(event => event.event === 'start' && event.phase !== 'SUMMARY');
+  const summaries = lifecycle.filter(event => event.event === 'start' && event.phase === 'SUMMARY');
+  assert.ok(summaries.length > 0, 'substantive responses receive real summary calls through the CLI adapter');
+  for (const call of summaries) {
+    assert.equal(call.provider, 'codex');
+    assert.equal(call.model, 'gpt-6-sol', 'summaries use the requested GPT-6 Sol model');
+    assert.equal(call.outputSchema, true, 'summaries are constrained by a provider output schema');
+    assert.equal(call.webSearch, false);
+    assert.ok(!call.prompt.includes(sourceMarker) && !call.prompt.includes(noteMarker), 'summary calls contain the response, without reattaching private source files');
+  }
   const active = new Map();
   for (const event of lifecycle) {
     if (event.event === 'end') { active.delete(event.callId); continue; }
-    assert.ok(active.size === 0 || (event.phase === 'REVIEW' && [...active.values()].every(call => call.phase === 'REVIEW')),
+    assert.ok(active.size === 0 || (['REVIEW', 'KNOWLEDGE'].includes(event.phase) && [...active.values()].every(call => call.phase === event.phase)),
       `discussion turns must wait for their peers: ${event.provider} ${event.phase}`);
     active.set(event.callId, event);
   }
@@ -894,33 +1065,44 @@ try {
   assert.equal(calls.filter(call => call.phase === 'REVIEW' && call.version === 4).length, 4);
   assert.equal(calls.filter(call => call.phase === 'PLAN').length, 3, 'every question, including a cancelled question, gets its own perspectives');
   assert.equal(calls.filter(call => call.phase === 'JUDGE').length, 8, 'the moderator judges each reviewed candidate');
+  assert.equal(calls.filter(call => call.phase === 'KNOWLEDGE').length, 6, 'both assistants check their knowledge before every question');
+  assert.equal(calls.filter(call => call.phase === 'CLARIFICATION').length, 3, 'the moderator checks for missing user context before every question');
+  assert.deepEqual(calls.filter(call => call.phase === 'RESEARCH').map(call => [call.provider, call.turn]), [['claude', 2]], 'only the assistant lacking knowledge searches');
   assert.deepEqual(new Set(calls.map(call => call.provider)), new Set(['codex', 'claude']));
   for (const call of calls) {
-    const isModerator = ['PLAN', 'JUDGE'].includes(call.phase);
+    const isModerator = ['CLARIFICATION', 'PLAN', 'JUDGE'].includes(call.phase);
     assert.equal(call.model, isModerator ? 'gpt-6-sol' : `${call.provider}-test`, `${call.provider} ${call.phase} receives its selected --model`);
     if (isModerator) {
       assert.equal(call.provider, 'codex', 'moderation uses the existing Codex login');
-      assert.equal(call.rawPhase, call.phase === 'PLAN' ? 'PLANNING' : 'ADJUDICATION');
+      assert.equal(call.rawPhase, call.phase === 'PLAN' ? 'PLANNING' : call.phase === 'JUDGE' ? 'ADJUDICATION' : 'CLARIFICATION');
     }
-    assert.ok(call.prompt.includes(sourceMarker), `${call.provider} ${call.phase} receives CSV evidence`);
-    assert.ok(call.prompt.includes(noteMarker), `${call.provider} ${call.phase} receives text evidence`);
+    const researching = call.phase === 'RESEARCH';
+    assert.equal(call.webSearch, researching, `${call.provider} ${call.phase} enables web search only for research`);
+    assert.equal(call.prompt.includes(sourceMarker), !researching, `${call.provider} ${call.phase} receives CSV evidence unless it can search`);
+    assert.equal(call.prompt.includes(noteMarker), !researching, `${call.provider} ${call.phase} receives text evidence unless it can search`);
     if (call.turn === 2) {
       assert.ok(call.prompt.includes(followupGoal), 'every followup phase receives the current question');
       assert.ok(call.prompt.includes(initialGoal), 'every followup phase receives the original question');
-      assert.ok(call.prompt.includes(priorFinalMarker), 'every followup phase receives the prior agreed answer');
+      if (!researching) assert.ok(call.prompt.includes(priorFinalMarker), 'every followup phase receives the prior agreed answer');
+      if (['PLAN', 'ANALYSIS', 'CRITIQUE'].includes(call.phase)) assert.ok(call.prompt.includes(researchMarker), `${call.phase} receives the web research`);
     }
-    if (call.phase !== 'PLAN') {
+    if (!['CLARIFICATION', 'PLAN', 'KNOWLEDGE', 'RESEARCH'].includes(call.phase)) {
       for (const role of Object.values(call.turn === 1 ? initialRoles : followupRoles)) assert.ok(call.prompt.includes(role), `${call.phase} receives the current assigned perspectives`);
     }
   }
   assert.ok(calls.some(call => call.turn === 2 && call.provider === 'claude'));
   assert.ok(calls.some(call => call.turn === 2 && call.provider === 'codex'));
+  assert.ok(calls.find(call => call.phase === 'CRITIQUE' && call.turn === 1)?.prompt.includes('five people can save and find a note without help'), 'peer discussion receives the full original answer, not its display summary');
+  for (const call of calls.filter(call => call.phase === 'REVIEW' && call.version === 1)) {
+    assert.ok(call.prompt.includes('Start with one device. Add synchronization after validating the core workflow.'), 'reviewers receive the full exact candidate, not its short display summary');
+  }
+  await testClarificationUi(env);
   await testSavedDefaults(env);
   await testModeratorFailureUi();
   await testConnectionSetupUi();
   assert.deepEqual(errors, [], 'no renderer JavaScript errors or CSP violations');
-  console.log('GUI smoke passed: durable model/time defaults across full app restart, per-chat overrides, unavailable selections and save failure; moderator planning and role assignments, exact-model routing, validated consensus versus moderator decision with dissent, same-chat followup planning/context, neutral theme, Connections setup, streaming focus/scroll, exports, cancellation, history/reload, and console/CSP checks.');
-  console.log(`Screenshots: ${path.join(resultsDir, 'gui-empty.png')}, gui-final.png, gui-followup.png, gui-connections-connected.png, and gui-connections-setup.png`);
+  console.log('GUI smoke passed: durable clarification pauses across full app restart, empty-answer rejection, exact supplied context and explicit assumptions; GPT-6 Sol display summaries with expandable originals and full review context; durable model/time defaults, per-chat overrides and save failure; moderator roles, model routing, consensus versus dissent, followup/research/source context, neutral theme, Connections setup, streaming focus/scroll, exports, cancellation, history/reload, and console/CSP checks.');
+  console.log(`Screenshots: ${path.join(resultsDir, 'gui-empty.png')}, gui-opening-discussion.png, gui-paired-reviews.png, gui-completed-multi-round.png, gui-clarification.png, gui-clarification-narrow.png, gui-clarification-answered.png, gui-clarification-assumptions.png, gui-followup.png, gui-research.png, and gui-connections-setup.png`);
 } catch (error) {
   if (page) {
     await page.screenshot({ path: path.join(resultsDir, 'gui-failure.png') }).catch(() => {});

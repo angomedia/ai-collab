@@ -77,6 +77,20 @@ test('provider commands preserve subscription login and disable tools/customizat
   assert.equal(claude[claude.indexOf('--tools') + 1], '');
   assert.ok(claude.includes('--strict-mcp-config'));
   assert.ok(claude.includes('--no-session-persistence'));
+  assert.ok(codex.includes('web_search="disabled"'));
+  assert.ok(!claude.includes('--allowedTools'));
+});
+
+test('web research enables only each provider\'s search tool', () => {
+  const codex = providerArguments('codex', 'a-model', { webSearch: true });
+  assert.ok(codex.includes('web_search="live"') && !codex.includes('web_search="disabled"'));
+  assert.equal(codex[codex.indexOf('--sandbox') + 1], 'read-only');
+  for (const feature of ['shell_tool', 'unified_exec', 'apps', 'plugins', 'multi_agent', 'computer_use', 'browser_use']) assert.equal(codex[codex.indexOf(feature) - 1], '--disable');
+  const claude = providerArguments('claude', 'sonnet', { webSearch: true });
+  assert.equal(claude[claude.indexOf('--tools') + 1], 'WebSearch');
+  assert.equal(claude[claude.indexOf('--allowedTools') + 1], 'WebSearch');
+  assert.ok(claude.includes('--safe-mode') && claude.includes('--strict-mcp-config'));
+  assert.equal(claude[claude.indexOf('--permission-prompts') + 1], 'none');
 });
 
 test('Codex streaming emits public text once and ignores reasoning', () => {
@@ -283,4 +297,18 @@ test('invalid schemas fail before starting any CLI and ordinary calls do not opt
   await adapter.runProvider({ provider: 'codex', prompt: 'Ordinary call', cwd: '/isolated' });
   assert.ok(!adapter.calls.find(call => call.args.includes('exec')).args.includes('--output-schema'));
   assert.deepEqual(await readdir(temporaryRoot), []);
+});
+
+test('a web research call passes the search flag and keeps only the final answer', async () => {
+  const lines = [
+    { type: 'item.completed', item: { type: 'agent_message', id: 'progress', text: 'Searching for the device.' } },
+    { type: 'item.completed', item: { type: 'web_search', id: 'search', query: 'iPhone Duo' } },
+    { type: 'item.completed', item: { type: 'agent_message', id: 'final', text: 'Brief with sources.' } },
+    { type: 'turn.completed' },
+  ];
+  const adapter = fixture({ stdoutChunks: [Buffer.from(lines.map(line => JSON.stringify(line)).join('\n'))] });
+  const output = await adapter.runProvider({ provider: 'codex', prompt: 'Research', cwd: '/isolated', webSearch: true });
+  assert.equal(output.text, 'Brief with sources.');
+  assert.ok(adapter.calls.find(call => call.args.includes('exec')).args.includes('web_search="live"'));
+  await assert.rejects(adapter.runProvider({ provider: 'codex', prompt: 'Research', cwd: '/isolated', webSearch: 'yes' }), /web search setting/);
 });

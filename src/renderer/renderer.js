@@ -13,6 +13,8 @@
   const messageNodes = new Map();
   const turnNodes = new Map();
   const connectionNodes = new Map();
+  const clarificationDrafts = new Map();
+  const reviewGroups = new Map();
   let autoScroll = true;
   let scrollScheduled = false;
   let toastTimer;
@@ -23,12 +25,13 @@
   let renderedHistorySignature = '';
   let connectionsReturnFocus = null;
   let queuedModelRefresh = false;
+  let clarificationScrollKey = null;
   const DEFAULT_MODERATOR_MODEL = 'gpt-6-sol';
   const names = { codex: 'Codex (ChatGPT)', claude: 'Claude', moderator: 'Moderator', system: 'System' };
   const shortNames = { codex: 'Codex', claude: 'Claude' };
   const providerHelp = { codex: { auth: 'https://learn.chatgpt.com/docs/auth', install: 'https://learn.chatgpt.com/docs/codex/cli' }, claude: { auth: 'https://code.claude.com/docs/en/authentication', install: 'https://code.claude.com/docs/en/setup' } };
-  const kindNames = { plan: 'Perspectives', planning: 'Perspectives', analysis: 'Independent view', critique: 'Response', candidate: 'Draft', review: 'Review', adjudication: 'Decision' };
-  const phaseNames = { starting: 'Getting started', planning: 'Moderator is assigning perspectives', analysis: 'Considering your question', critique: 'Discussing the proposals', synthesis: 'Preparing a shared draft', candidate: 'Preparing a shared draft', review: 'Checking the draft', revision: 'Resolving objections', adjudication: 'Moderator is weighing the draft and reviews', stopping: 'Stopping' };
+  const kindNames = { clarification: 'A little context', plan: 'Perspectives', planning: 'Perspectives', analysis: 'Opening view', critique: 'Response', candidate: 'Shared draft', review: 'Draft review', adjudication: 'Decision', research: 'Web research' };
+  const phaseNames = { starting: 'Getting started', clarification: 'Checking what else would help', awaiting_input: 'Your perspective is needed', knowledge: 'Checking whether anything needs looking up', research: 'Searching the web for missing context', planning: 'Assigning two starting perspectives', analysis: 'Exploring both perspectives', critique: 'Challenging and refining the ideas', synthesis: 'Bringing the ideas into a draft', candidate: 'Bringing the ideas into a draft', review: 'Reviewing the same draft', revision: 'Working through the objections', adjudication: 'Weighing the reviews', stopping: 'Stopping' };
 
   function node(tag, className, value) {
     const element = document.createElement(tag);
@@ -42,7 +45,8 @@
   function isSetupPending(info) { return info?.setup?.pending ?? (!!info?.setup?.action && !info.setup.error); }
   function providerSetupPending() { return ['codex', 'claude'].some((provider) => state.setupBusy[provider] || isSetupPending(state.providers[provider])); }
   function dateValue(value) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? new Date() : date; }
-  function statusLabel(status) { return ({ running: 'Discussing', completed: 'Complete', cancelled: 'Stopped', interrupted: 'Interrupted', failed: 'Needs attention', timed_out: 'Time limit reached' })[status] || status || ''; }
+  function statusLabel(status) { return ({ running: 'In progress', awaiting_input: 'Your input needed', completed: 'Complete', cancelled: 'Stopped', interrupted: 'Interrupted', failed: 'Needs attention', timed_out: 'Time limit reached' })[status] || status || ''; }
+  function pendingClarification(run = selectedRun()) { return run?.status === 'awaiting_input' && run.clarification?.status === 'pending' ? run.clarification : null; }
   function shortDate(value) { const date = dateValue(value); return date.toDateString() === new Date().toDateString() ? 'Today' : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); }
   function toast(value) { clearTimeout(toastTimer); $('toast').textContent = value; $('toast').hidden = false; toastTimer = setTimeout(() => { $('toast').hidden = true; }, 4000); }
   function preferenceValues(value) {
@@ -69,14 +73,17 @@
   function getTurns(run) {
     if (!run) return [];
     if (Array.isArray(run.turns) && run.turns.length) {
-      return run.turns.map((turn, index) => index === run.turns.length - 1 ? { ...turn, status: run.status, final: run.final ?? turn.final, error: run.error || turn.error, updatedAt: run.updatedAt } : turn);
+      return run.turns.map((turn, index) => index === run.turns.length - 1 ? { ...turn, status: run.status, final: run.final ?? turn.final, clarification: run.clarification ?? turn.clarification, error: run.error || turn.error, updatedAt: run.updatedAt } : turn);
     }
-    return [{ id: run.turnId || run.id, question: run.currentQuestion || run.goal, createdAt: run.createdAt, updatedAt: run.updatedAt, status: run.status, final: run.final, error: run.error, models: run.models, plan: run.plan }];
+    return [{ id: run.turnId || run.id, question: run.currentQuestion || run.goal, createdAt: run.createdAt, updatedAt: run.updatedAt, status: run.status, final: run.final, error: run.error, models: run.models, plan: run.plan, clarification: run.clarification }];
   }
   function elapsed(run) {
     const turn = getTurns(run).at(-1);
     const end = run.status === 'running' ? Date.now() : dateValue(turn?.updatedAt || run.updatedAt).valueOf();
-    const seconds = Math.max(0, Math.floor((end - dateValue(turn?.createdAt || run.createdAt).valueOf()) / 1000));
+    const budget = Number(turn?.timeoutMinutes || run.timeoutMinutes) * 60000;
+    const remaining = run.status === 'running' && Number.isFinite(run.deadline) ? Math.max(0, run.deadline - Date.now()) : run.remainingTimeMs;
+    const duration = Number.isFinite(budget) && Number.isFinite(remaining) ? budget - remaining : end - dateValue(turn?.createdAt || run.createdAt).valueOf();
+    const seconds = Math.max(0, Math.floor(duration / 1000));
     return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
   }
   function safeUrl(value) {
@@ -190,7 +197,7 @@
       const issues = Array.isArray(review.issues) ? review.issues.filter((item) => typeof item === 'string' && item.trim()) : [];
       const suggestions = Array.isArray(review.suggestions) ? review.suggestions.filter((item) => typeof item === 'string' && item.trim()) : [];
       const approved = review.verdict === 'approve' && !issues.length;
-      const version = review.candidate_version || review.version;
+      const version = review.candidate_version || review.candidateVersion || review.version;
       const output = [`**${approved ? 'I agree with this draft' : 'I still have concerns'}${Number.isInteger(version) ? ` (version ${version})` : ''}.**`];
       if (typeof review.summary === 'string' && review.summary.trim()) output.push(review.summary);
       if (issues.length) output.push(issues.map((issue) => `- ${issue}`).join('\n'));
@@ -239,13 +246,15 @@
       body.append(node('p', 'message-failure', messageFailure(message, 'The moderator could not validate a plan with two distinct perspectives.')));
       return { body, text: body.textContent };
     }
-    body.append(node('p', 'plan-question', plan.refinedQuestion));
+    body.append(node('span', 'section-eyebrow', 'The question we’re exploring'), node('p', 'plan-question', plan.refinedQuestion));
     const roles = node('div', 'plan-roles');
     const text = [plan.refinedQuestion];
     for (const provider of ['codex', 'claude']) {
       const role = plan.roles[provider];
-      const line = node('p', 'plan-role');
-      line.append(node('strong', '', `${shortNames[provider]}: `), document.createTextNode(String(role.label)));
+      const line = node('div', `plan-role ${provider}`);
+      const identity = node('div', 'role-identity');
+      identity.append(node('span', `mini-avatar ${provider}`, 'C'), node('strong', '', shortNames[provider]));
+      line.append(identity, node('span', 'role-caption', 'STARTING PERSPECTIVE'), node('p', 'role-label', role.label));
       roles.append(line); text.push(`${shortNames[provider]}: ${role.label}`);
     }
     body.append(roles);
@@ -271,8 +280,8 @@
     const incomingTurns = incoming.turns?.length || 1;
     const previousTurns = previous.turns?.length || 1;
     if (incomingTurns !== previousTurns) return incomingTurns < previousTurns;
-    if (previous.status !== 'running' && incoming.status === 'running') return true;
-    if (incoming.status !== 'running' && previous.status === 'running') return false;
+    if (!['running', 'awaiting_input'].includes(previous.status) && incoming.status === 'running') return true;
+    if (!['running', 'awaiting_input'].includes(incoming.status) && previous.status === 'running') return false;
     return (incoming.messages || []).length < (previous.messages || []).length;
   }
 
@@ -567,25 +576,28 @@
 
   function updateControls() {
     const draft = currentDraft(); const run = selectedRun(); const active = activeRun(); const sources = sourcesFor(run, draft);
+    const pending = pendingClarification(run);
     for (const entry of turnNodes.values()) {
+      updateClarificationControls(entry);
       if (!entry.retry) continue;
       const draftText = draft.text.trim();
       entry.retry.disabled = state.starting || !!active || (!!draftText && draftText !== entry.user.textContent.trim());
       entry.retry.title = entry.retry.disabled && draftText ? 'Your unsent draft is kept below. Clear it to reuse this question.' : 'Restore this question in the composer. Files stay attached to this chat.';
     }
     const ready = ['codex', 'claude'].every((provider) => state.providers[provider]?.available && state.providers[provider]?.compatible !== false && state.providers[provider]?.authenticated === true);
-    $('start-debate').disabled = state.starting || !state.preferencesLoaded || !!state.attachmentsBusy || providerSetupPending() || !!active || !ready || !moderatorAvailable() || !draft.text.trim() || sourceLimit(sources);
+    $('start-debate').disabled = !!pending || state.starting || !state.preferencesLoaded || !!state.attachmentsBusy || providerSetupPending() || !!active || !ready || !moderatorAvailable() || !draft.text.trim() || sourceLimit(sources);
     $('start-debate').setAttribute('aria-label', run ? 'Send follow-up' : 'Send question');
-    $('attach-files').disabled = state.starting || !!state.attachmentsBusy || sources.length >= 8;
+    $('attach-files').disabled = !!pending || state.starting || !!state.attachmentsBusy || sources.length >= 8;
     $('attach-files-label').textContent = state.attachmentsBusy || 'Attach';
     $('attach-files').title = sources.length >= 8 ? 'This chat already has 8 files.' : 'Attach PDF, Word, text, CSV, JSON, or Excel files';
     $('composer-context').textContent = sources.length ? `${sources.length} ${sources.length === 1 ? 'file' : 'files'}` : '';
     $('composer-context').title = `${sourceChars(sources).toLocaleString()} of 200,000 extracted characters · Up to 8 files per chat`;
-    $('stop-active-run').hidden = !active; $('stop-active-run').disabled = active?.phase === 'stopping';
+    $('stop-active-run').hidden = !active && !pending; $('stop-active-run').disabled = active?.phase === 'stopping';
     $('view-active').hidden = !active || active.id === state.selectedRunId;
     $('send-error').hidden = !draft.error; $('send-error').textContent = draft.error;
     let notice = '';
-    if (sourceLimit(sources)) notice = sources.length > 8 ? 'Choose up to 8 files per chat. Remove a new attachment to send.' : 'The files exceed 200,000 extracted characters. Remove a new attachment or start a new chat.';
+    if (pending) notice = 'Answer the questions above, or choose Use best judgment, to continue.';
+    else if (sourceLimit(sources)) notice = sources.length > 8 ? 'Choose up to 8 files per chat. Remove a new attachment to send.' : 'The files exceed 200,000 extracted characters. Remove a new attachment or start a new chat.';
     else if (providerSetupPending()) notice = ['codex', 'claude'].some((provider) => isSetupPending(state.providers[provider]) && state.providers[provider]?.setup?.error) ? `Finish or cancel setup in ${setupTerminal}, then refresh Connections before sending.` : `Finish connecting in ${setupTerminal} and your browser before sending.`;
     else if (['codex', 'claude'].some(provider => state.providers[provider]?.compatible === false)) notice = 'Open Connections to update the CLI before sending.';
     else if (!ready && Object.keys(state.providers).length) {
@@ -599,6 +611,73 @@
     renderConnections();
   }
 
+  function draftVersion(message) {
+    return message.candidateVersion || message.review?.candidateVersion || message.review?.candidate_version || message.adjudication?.candidate_version || null;
+  }
+  function responseSummary(message) {
+    const summary = message.summary;
+    return summary && typeof summary === 'object' && !Array.isArray(summary) && typeof summary.headline === 'string' && summary.headline.trim()
+      ? { headline: summary.headline, points: stringList(summary.points).slice(0, 3) } : null;
+  }
+  function renderCompactResponse(message, entry) {
+    // Keep the full-response node stable while deltas arrive: an open detail,
+    // selection, and reader scroll position must survive each snapshot.
+    if (!entry.compact) {
+      const summary = node('div', 'message-summary');
+      const eyebrow = node('span', 'summary-label');
+      const headline = node('p', 'summary-headline');
+      const points = node('ul', 'summary-points');
+      const preview = node('p', 'response-excerpt');
+      summary.append(eyebrow, headline, points, preview);
+      const details = node('details', 'full-response');
+      const toggle = node('summary', '', 'Full response');
+      const full = node('div', 'markdown-content full-response-content');
+      const attribution = node('p', 'summary-attribution', 'The short version above was summarized by GPT-6 Sol. This is the assistant’s original response.');
+      details.append(toggle, attribution, full); entry.body.replaceChildren(summary, details);
+      entry.compact = { summary, eyebrow, headline, points, preview, details, toggle, full, attribution };
+    }
+    const compact = entry.compact;
+    const summary = responseSummary(message);
+    const running = message.status === 'running';
+    const text = String(message.text || '');
+    compact.eyebrow.textContent = summary ? 'KEY POINTS' : running ? 'LIVE RESPONSE' : 'RESPONSE PREVIEW';
+    compact.headline.hidden = !summary;
+    compact.points.hidden = !summary?.points.length;
+    compact.preview.hidden = !!summary;
+    compact.attribution.hidden = !summary;
+    if (summary) {
+      if (compact.headline.textContent !== summary.headline) compact.headline.textContent = summary.headline;
+      const pointsKey = JSON.stringify(summary.points);
+      if (compact.points.dataset.signature !== pointsKey) { compact.points.dataset.signature = pointsKey; compact.points.replaceChildren(...summary.points.map(text => node('li', '', text))); }
+    } else {
+      // An excerpt is explicitly labelled; it is never presented as an AI summary.
+      const excerpt = text.trim().replace(/\s+/g, ' ');
+      const preview = excerpt ? `${excerpt.slice(0, 280)}${excerpt.length > 280 ? '…' : ''}` : message.status === 'failed' ? messageFailure(message, 'No response was returned.') : 'Thinking through this perspective…';
+      if (compact.preview.textContent !== preview) compact.preview.textContent = preview;
+    }
+    compact.toggle.textContent = running ? 'Full response · live' : 'Full response';
+    if (compact.full.dataset.text !== text) { compact.full.dataset.text = text; compact.full.replaceChildren(text ? markdown(text) : node('p', 'message-placeholder', 'The response will appear here as it arrives.')); }
+  }
+  function renderReview(message, entry) {
+    const review = message.review || structuredMessage(message, 'review');
+    const pending = message.status === 'running' || message.text === 'Validating the response…';
+    const approved = !pending && review?.valid !== false && review?.verdict === 'approve' && !stringList(review.issues).length;
+    const usable = !pending && review && ['approve', 'revise'].includes(review.verdict);
+    const badge = node('span', `review-verdict ${approved ? 'approved' : 'concern'}`, pending ? 'Reviewing…' : approved ? '✓ Approves' : usable ? 'Changes requested' : 'Review unavailable');
+    entry.element.dataset.verdict = approved ? 'approve' : pending ? 'pending' : 'revise';
+    entry.body.replaceChildren(badge);
+    if (pending) { entry.body.append(node('p', 'message-placeholder', 'Checking this exact draft.')); return; }
+    if (!usable) { const safe = node('div', 'review-explanation'); safe.append(markdown(naturalReview(message))); entry.body.append(safe); return; }
+    const explanation = typeof review.summary === 'string' && review.summary.trim() ? review.summary : approved ? 'No blocking concerns with this draft.' : 'These concerns need to be addressed.';
+    entry.body.append(node('p', 'review-explanation', explanation));
+    const issues = stringList(review.issues);
+    if (issues.length) { const list = node('ul', 'review-issues'); for (const issue of issues.slice(0, 2)) list.append(node('li', '', issue)); entry.body.append(list); }
+    const suggestions = stringList(review.suggestions);
+    if (issues.length > 2 || suggestions.length) {
+      const details = node('details', 'review-details'); details.append(node('summary', '', 'Review details'));
+      const list = node('ul'); for (const text of [...issues.slice(2), ...suggestions]) list.append(node('li', '', text)); details.append(list); entry.body.append(details);
+    }
+  }
   function renderMessage(message, container, turn) {
     let entry = messageNodes.get(message.id);
     if (!entry) {
@@ -606,50 +685,62 @@
         const element = node('div', 'system-message'); entry = { element, body: element, system: true };
       } else {
         const provider = ['codex', 'claude', 'moderator'].includes(message.provider) ? message.provider : 'codex';
-        const element = node('article', `assistant-message ${provider}`); element.dataset.provider = provider;
+        const element = node('article', `assistant-message ${provider}`); element.dataset.provider = provider; element.dataset.kind = message.kind;
         const heading = node('div', 'message-heading');
-        const dot = node('span', 'provider-dot'); dot.setAttribute('aria-hidden', 'true');
+        const dot = node('span', 'provider-dot', provider === 'moderator' ? '◇' : 'C'); dot.setAttribute('aria-hidden', 'true');
         const label = node('span', 'message-label');
         const copy = node('button', 'message-copy', 'Copy'); copy.title = `Copy ${names[provider]}’s response`;
         copy.addEventListener('click', () => copyText(entry.copyText || ''));
         const name = node('strong', 'message-name', names[provider]);
-        heading.append(dot, name, label, copy);
+        const identity = node('div', 'message-identity'); identity.append(name, label);
+        heading.append(dot, identity, copy);
         const perspective = node('p', 'message-perspective'); perspective.hidden = true;
-        const body = node('div', 'markdown-content'); element.append(heading, perspective, body);
+        const body = node('div', 'message-body markdown-content'); element.append(heading, perspective, body);
         entry = { element, body, label, name, perspective, copy };
       }
       messageNodes.set(message.id, entry);
     }
     if (entry.element.parentNode !== container) container.append(entry.element);
-    if (entry.system) { entry.body.textContent = message.text || message.title || ''; return; }
+    if (entry.system) { const text = message.text || message.title || ''; if (entry.body.textContent !== text) entry.body.textContent = text; return; }
     const status = messageStatusLabel(message);
-    const label = `${kindNames[message.kind] || 'Response'}${status ? ` · ${status}` : ''}`;
+    const version = draftVersion(message);
+    const label = `${kindNames[message.kind] || 'Response'}${version && ['candidate', 'review'].includes(message.kind) ? ` ${version}` : ''}${status ? ` · ${status}` : ''}`;
     if (entry.label.textContent !== label) entry.label.textContent = label;
+    entry.element.classList.toggle('is-streaming', message.status === 'running');
+    entry.element.classList.toggle('is-failed', message.status === 'failed');
     const name = message.provider === 'moderator' ? `Moderator · ${modelLabel('moderator', message.model || turn.models?.moderator || DEFAULT_MODERATOR_MODEL)}` : names[message.provider] || names.codex;
     if (entry.name.textContent !== name) entry.name.textContent = name;
-    const role = turn.plan?.roles?.[message.provider];
-    const perspective = role?.label ? `Starting perspective: ${role.label}` : '';
+    // Research remains visible, including citations, and precedes role assignment.
+    const researching = message.kind === 'research';
+    const role = researching || message.kind === 'review' ? null : turn.plan?.roles?.[message.provider];
+    const lookup = stringList(message.lookup).length ? stringList(message.lookup) : stringList(message.queries);
+    const perspective = researching ? lookup.length ? `Looking up: ${lookup.join(', ')}` : '' : role?.label ? `Starting perspective: ${role.label}` : '';
     entry.perspective.hidden = !perspective;
     if (entry.perspective.textContent !== perspective) entry.perspective.textContent = perspective;
     entry.perspective.title = typeof role?.instructions === 'string' ? role.instructions : '';
-    const signature = JSON.stringify([message.text, message.status, message.error, message.failureKind, message.review, message.summary, message.plan, message.adjudication, message.decision]);
+    const signature = JSON.stringify([message.text, message.status, message.error, message.failureKind, message.review, message.summary, message.plan, message.adjudication, message.decision, message.clarification]);
     if (signature === entry.signature) return;
     entry.signature = signature;
     const planning = ['plan', 'planning'].includes(message.kind);
     const adjudicating = message.kind === 'adjudication';
-    const pendingStructured = (planning || adjudicating || message.kind === 'review') && (message.status === 'running' || message.text === 'Validating the response…');
+    const clarifying = message.kind === 'clarification';
+    const pendingStructured = (planning || adjudicating || clarifying || message.kind === 'review') && (message.status === 'running' || message.text === 'Validating the response…');
     entry.body.classList.toggle('moderator-adjudication', adjudicating);
     entry.copy.disabled = pendingStructured;
-    if (pendingStructured) {
+    if (pendingStructured && message.kind !== 'review') {
       entry.copyText = '';
-      entry.body.replaceChildren(node('p', 'message-placeholder', planning ? 'Refining the question and assigning distinct perspectives…' : adjudicating ? 'Weighing the draft, reviews, and remaining disagreements…' : 'Checking the draft and its remaining assumptions…'));
+      entry.body.replaceChildren(node('p', 'message-placeholder', planning ? 'Refining the question and assigning distinct perspectives…' : adjudicating ? 'Weighing the draft, reviews, and remaining disagreements…' : 'Checking whether a little more context would change the answer…'));
       return;
     }
-    if (planning) {
-      const plan = planContent(message); entry.copyText = plan.text; entry.body.replaceChildren(plan.body); return;
+    if (planning) { const plan = planContent(message); entry.copyText = plan.text; entry.body.replaceChildren(plan.body); return; }
+    if (clarifying) {
+      const text = message.clarification?.reason || messageFailure(message, 'The clarification check could not be completed.');
+      entry.copyText = text; entry.body.replaceChildren(node('p', 'message-failure', text)); return;
     }
     const text = message.kind === 'review' ? naturalReview(message) : adjudicating ? naturalAdjudication(message) : message.text || '';
     entry.copyText = text;
+    if (message.kind === 'review') { renderReview(message, entry); return; }
+    if (['analysis', 'critique', 'candidate'].includes(message.kind)) { renderCompactResponse(message, entry); return; }
     entry.body.replaceChildren(text ? markdown(text) : node('p', 'message-placeholder', 'Thinking…'));
   }
 
@@ -669,7 +760,7 @@
     const heading = node('div', 'final-heading');
     heading.append(node('h3', '', ready ? 'Final answer' : 'Latest draft'), node('span', `final-badge${agreed ? '' : ' unresolved'}`, agreed ? 'Both agree' : decided ? 'Moderator decision' : !reviewed ? 'Not fully reviewed' : moderated ? 'Not finalized' : 'Open questions'));
     const answer = node('div', 'markdown-content'); answer.append(markdown(final.text));
-    entry.final.replaceChildren(heading);
+    entry.final.replaceChildren(node('div', 'section-eyebrow final-eyebrow', ready ? 'THE RESULT' : 'WHERE THE DISCUSSION REACHED'), heading);
     if (!ready) {
       const explanation = !reviewed ? 'The chat stopped before both assistants reviewed this draft. Treat it as unfinished.' : moderated ? `${turn.status === 'timed_out' ? 'The time limit was reached' : 'The chat stopped'} before the moderator finalized this draft. Treat it as unfinished.` : turn.status === 'timed_out' ? 'The time limit was reached. This draft keeps the remaining disagreements visible.' : 'This is the latest reviewed answer. The assistants still have unresolved objections.';
       entry.final.append(node('p', 'final-note', explanation));
@@ -708,6 +799,146 @@
     footer.append(copy, node('span', 'final-version', `Draft ${final.version || 1}`)); entry.final.append(footer);
   }
 
+  function clarificationDraft(runId, clarification) {
+    const key = `${runId}:${clarification.id}`;
+    if (!clarificationDrafts.has(key)) clarificationDrafts.set(key, { answers: Object.fromEntries((clarification.answers || []).map(item => [item.id, item.answer])), busy: false, error: '' });
+    return clarificationDrafts.get(key);
+  }
+  function updateClarificationControls(entry) {
+    const ui = entry.clarificationUI;
+    if (!ui) return;
+    const { runId, clarification, local } = ui;
+    const run = state.runs.find(item => item.id === runId);
+    const pending = run?.status === 'awaiting_input' && run.clarification?.id === clarification.id && run.clarification?.status === 'pending';
+    const active = activeRun();
+    const ready = ['codex', 'claude'].every(provider => state.providers[provider]?.available && state.providers[provider]?.compatible !== false && state.providers[provider]?.authenticated === true);
+    const locked = !pending || local.busy || state.starting || !!active || providerSetupPending() || !ready;
+    for (const field of ui.fields) {
+      field.input.disabled = locked;
+      for (const button of field.options) {
+        button.disabled = locked;
+        button.setAttribute('aria-pressed', String(local.answers[field.id]?.trim() === button.textContent));
+      }
+    }
+    ui.submit.disabled = locked || clarification.questions.some(question => !local.answers[question.id]?.trim());
+    ui.submit.textContent = local.busy ? 'Continuing…' : 'Continue debate';
+    ui.assumptions.disabled = locked;
+    const status = active && active.id !== runId ? 'Another chat is running. Finish or stop it before continuing this debate.' : providerSetupPending() ? `Finish connecting in ${setupTerminal} before continuing.` : !ready ? 'Connect both assistants to continue. Your answers will stay here.' : 'Take your time. The debate’s time limit is paused while you answer.';
+    ui.status.textContent = status;
+    ui.error.hidden = !local.error; ui.error.textContent = local.error;
+  }
+  async function answerClarification(runId, clarification, useAssumptions) {
+    const local = clarificationDraft(runId, clarification);
+    const run = state.runs.find(item => item.id === runId);
+    const ready = ['codex', 'claude'].every(provider => state.providers[provider]?.available && state.providers[provider]?.compatible !== false && state.providers[provider]?.authenticated === true);
+    if (local.busy || state.starting || activeRun() || providerSetupPending() || !ready || !pendingClarification(run) || run.clarification.id !== clarification.id) return;
+    const answers = clarification.questions.map(question => ({ id: question.id, answer: (local.answers[question.id] || '').trim() })).filter(answer => answer.answer);
+    if (!useAssumptions && answers.length !== clarification.questions.length) return;
+    local.busy = true; local.error = ''; updateControls();
+    try {
+      const updated = await bridge.answerClarification(runId, { clarificationId: clarification.id, answers, useAssumptions });
+      if (state.selectedRunId === runId) autoScroll = true;
+      onRunUpdate(updated);
+      if (state.selectedRunId === runId) $('goal').focus();
+    } catch (error) { local.error = errorText(error); }
+    finally { local.busy = false; updateControls(); }
+  }
+  function renderClarification(run, turn, entry) {
+    const clarification = turn.clarification;
+    const visible = clarification?.needsClarification && Array.isArray(clarification.questions) && clarification.questions.length;
+    entry.clarification.hidden = !visible;
+    if (!visible) return;
+    const pending = clarification.status === 'pending' && turn.status === 'awaiting_input';
+    const signature = JSON.stringify([clarification.id, clarification.status, clarification.reason, clarification.questions, clarification.answers, pending]);
+    if (entry.clarificationSignature === signature) { updateClarificationControls(entry); return; }
+    entry.clarificationSignature = signature;
+    entry.clarificationUI = null;
+    const panel = entry.clarification;
+    panel.dataset.clarificationId = clarification.id;
+    panel.classList.toggle('answered', !pending);
+    panel.replaceChildren();
+    const header = node('div', 'clarification-heading');
+    header.append(node('span', 'moderator-mark', '◇'), node('span', 'section-eyebrow', pending ? 'BEFORE WE BEGIN' : 'YOUR CONTEXT'));
+    panel.append(header);
+    if (!pending) {
+      const assumptions = clarification.status === 'assumptions';
+      panel.append(node('h3', '', assumptions ? 'Continuing with your context and best judgment' : clarification.status === 'cancelled' ? 'Clarification was cancelled' : 'Your answers are part of the debate'));
+      const details = node('details', 'clarification-recap'); details.append(node('summary', '', assumptions ? 'Answers and assumptions' : 'View your answers'));
+      const answers = new Map((clarification.answers || []).map(answer => [answer.id, answer.answer]));
+      for (const question of clarification.questions) {
+        const item = node('div', 'clarification-recap-item');
+        item.append(node('strong', '', question.question), node('p', '', answers.get(question.id) || (assumptions ? 'Use a clearly stated assumption.' : 'No answer supplied.'))); details.append(item);
+      }
+      panel.append(details); return;
+    }
+    panel.append(node('h3', '', 'A little context will make this more useful.'), node('p', 'clarification-reason', clarification.reason));
+    const form = node('form', 'clarification-form');
+    const local = clarificationDraft(run.id, clarification);
+    const fields = [];
+    for (const [index, question] of clarification.questions.slice(0, 3).entries()) {
+      const field = node('div', 'clarification-question'); field.dataset.questionId = question.id;
+      const inputId = `clarification-${clarification.id}-${index}`;
+      const label = node('label', 'clarification-label'); label.htmlFor = inputId;
+      label.append(node('span', 'question-number', String(index + 1)), document.createTextNode(question.question));
+      const options = node('div', 'clarification-options');
+      const buttons = [];
+      const input = node('textarea', 'clarification-answer'); input.id = inputId; input.rows = 2; input.maxLength = 4000; input.placeholder = question.options?.length ? 'Choose an option above, or answer in your own words…' : 'Your answer…'; input.value = local.answers[question.id] || '';
+      for (const choice of stringList(question.options).slice(0, 5)) {
+        const button = node('button', 'clarification-option', choice); button.type = 'button'; button.setAttribute('aria-pressed', String(input.value.trim() === choice));
+        button.addEventListener('click', () => { local.answers[question.id] = choice; local.error = ''; input.value = choice; updateClarificationControls(entry); });
+        buttons.push(button); options.append(button);
+      }
+      input.addEventListener('input', () => { local.answers[question.id] = input.value; local.error = ''; updateClarificationControls(entry); });
+      field.append(label); if (buttons.length) field.append(options); field.append(input); form.append(field); fields.push({ id: question.id, input, options: buttons });
+    }
+    const actions = node('div', 'clarification-actions');
+    const submit = node('button', 'clarification-continue', 'Continue debate'); submit.type = 'submit';
+    const assumptions = node('button', 'clarification-assumptions', 'Use best judgment'); assumptions.type = 'button'; assumptions.title = 'Continue with any answers you supplied and clearly stated assumptions for the rest.';
+    assumptions.addEventListener('click', () => answerClarification(run.id, clarification, true));
+    actions.append(submit, assumptions); form.append(actions);
+    const hint = node('p', 'clarification-assumptions-note', 'Use best judgment lets the assistants make explicit assumptions for anything you leave open.');
+    const status = node('p', 'clarification-status'); status.setAttribute('role', 'status');
+    const error = node('p', 'clarification-error'); error.setAttribute('role', 'alert'); error.hidden = true;
+    form.addEventListener('submit', event => { event.preventDefault(); answerClarification(run.id, clarification, false); });
+    panel.append(form, hint, status, error);
+    entry.clarificationUI = { runId: run.id, clarification, local, fields, submit, assumptions, status, error };
+    updateClarificationControls(entry);
+  }
+  function renderProgress(run) {
+    $('debate-progress').hidden = !run;
+    if (!run) return;
+    const phase = run.phase;
+    const stage = run.status === 'completed' ? 3 : ['review', 'revision', 'adjudication'].includes(phase) ? 2 : ['knowledge', 'research', 'planning', 'analysis', 'critique', 'synthesis', 'candidate'].includes(phase) ? 1 : phase === 'awaiting_input' || phase === 'clarification' || phase === 'starting' ? 0 : run.final ? 2 : (run.messages || []).some(message => message.kind === 'analysis') ? 1 : 0;
+    [...$('debate-progress').querySelectorAll('.progress-step')].forEach((step, index) => {
+      step.classList.toggle('is-current', index === stage); step.classList.toggle('is-complete', index < stage || run.status === 'completed');
+      if (index === stage) step.setAttribute('aria-current', 'step'); else step.removeAttribute('aria-current');
+      step.querySelector('.step-number').textContent = index < stage || run.status === 'completed' ? '✓' : String(index + 1);
+    });
+    const detail = run.status === 'awaiting_input' ? 'Waiting for you · timer paused' : run.status === 'running' ? `${phaseNames[phase] || 'Working through the question'}${run.round > 0 && stage === 2 ? ` · Draft ${run.round}` : ''}` : statusLabel(run.status);
+    if ($('progress-detail').textContent !== detail) $('progress-detail').textContent = detail;
+  }
+  function reviewContainer(message, entry, turn, sequence, superseded = false) {
+    const version = draftVersion(message) || sequence || 1;
+    const key = `${turn.id}:review:${version}`;
+    let group = reviewGroups.get(key);
+    if (!group) {
+      const element = node('section', 'review-comparison'); element.dataset.version = version;
+      const heading = node('div', 'review-comparison-heading'); heading.append(node('span', 'section-eyebrow', `DRAFT ${version}`), node('h3', '', 'Do both perspectives hold up?'), node('p', '', 'Both assistants review the same draft.'));
+      const pair = node('div', 'review-pair'); element.append(heading, pair); entry.messages.append(element);
+      group = { element, pair, sides: new Map() }; reviewGroups.set(key, group);
+    }
+    let side = group.sides.get(message.provider);
+    if (!side) {
+      const element = node('div', 'review-side'); element.dataset.provider = message.provider;
+      const current = node('div', 'review-current');
+      const previous = node('details', 'review-attempts'); previous.hidden = true;
+      previous.append(node('summary', '', 'Earlier review attempt'));
+      element.append(current, previous); group.pair.append(element);
+      side = { element, current, previous }; group.sides.set(message.provider, side);
+    }
+    if (superseded) side.previous.hidden = false;
+    return superseded ? side.previous : side.current;
+  }
   function renderThread(run) {
     const turns = getTurns(run);
     const known = new Set(turns.map((turn) => turn.id));
@@ -715,7 +946,9 @@
       let entry = turnNodes.get(turn.id);
       if (!entry) {
         const element = node('section', 'chat-turn'); element.dataset.turnId = turn.id;
+        const questionLabel = node('div', 'user-eyebrow', index === 0 ? 'YOUR QUESTION' : `FOLLOW-UP ${index}`);
         const user = node('div', 'user-message');
+        const clarification = node('section', 'clarification-panel'); clarification.hidden = true; clarification.setAttribute('aria-label', 'Clarification questions');
         const messages = node('div', 'turn-messages');
         const final = node('section', 'final-message'); final.hidden = true;
         const error = node('div', 'turn-error'); error.setAttribute('role', 'alert'); error.hidden = true;
@@ -731,8 +964,8 @@
           updateControls();
         });
         recovery.append(retry); error.append(errorText, recovery);
-        element.append(user, messages, final, error); $('thread').append(element);
-        entry = { element, user, messages, final, error, errorText, recovery, retry }; turnNodes.set(turn.id, entry);
+        element.append(questionLabel, user, clarification, messages, final, error); $('thread').append(element);
+        entry = { element, user, clarification, messages, final, error, errorText, recovery, retry, separators: new Map() }; turnNodes.set(turn.id, entry);
       }
       const question = turn.question || turn.goal || (index === 0 ? run.goal : run.currentQuestion) || '';
       if (entry.user.textContent !== question) entry.user.textContent = question;
@@ -740,29 +973,64 @@
         if (!message.turnId) return index === 0;
         return message.turnId === turn.id || (!known.has(message.turnId) && index === turns.length - 1);
       });
-      for (const message of messages) renderMessage(message, entry.messages, turn);
+      renderClarification(run, turn, entry);
+      const latestReviewIds = new Map();
+      let reviewDraft = 0;
+      for (const message of messages) {
+        if (message.kind === 'candidate') reviewDraft++;
+        if (message.kind === 'review') latestReviewIds.set(`${message.provider}:${draftVersion(message) || reviewDraft || 1}`, message.id);
+      }
+      let candidateNumber = 0;
+      for (const message of messages) {
+        // The dedicated context panel already displays the durable questions and answers.
+        if (message.kind === 'clarification_answer' || (message.kind === 'clarification' && turn.clarification?.needsClarification && message.status !== 'failed')) continue;
+        if (message.kind === 'candidate') {
+          candidateNumber++;
+          if (!entry.separators.has(message.id)) {
+            const version = draftVersion(message) || candidateNumber;
+            const separator = node('div', 'version-connector'); separator.dataset.version = version;
+            separator.append(node('span', '', version === 1 ? 'Bringing the perspectives together' : 'Refining the answer'), node('strong', '', `Draft ${version}`));
+            entry.messages.append(separator); entry.separators.set(message.id, separator);
+          }
+        }
+        const superseded = message.kind === 'review' && latestReviewIds.get(`${message.provider}:${draftVersion(message) || candidateNumber || 1}`) !== message.id;
+        const container = message.kind === 'review' ? reviewContainer(message, entry, turn, candidateNumber, superseded) : entry.messages;
+        renderMessage(message, container, turn);
+      }
       renderFinal(turn, entry);
       entry.error.hidden = !turn.error || turn.status === 'running';
       if (entry.errorText.textContent !== (turn.error || '')) entry.errorText.textContent = turn.error || '';
-      entry.recovery.hidden = index !== turns.length - 1 || turn.status !== 'failed' || !!turn.plan || !messages.some((message) => ['plan', 'planning'].includes(message.kind) && message.status === 'failed');
+      entry.recovery.hidden = index !== turns.length - 1 || turn.status !== 'failed' || !!turn.plan || !messages.some((message) => ['clarification', 'plan', 'planning'].includes(message.kind) && message.status === 'failed');
     }
   }
 
   function renderView() {
     const run = selectedRun();
+    const clarification = pendingClarification(run);
+    document.querySelector('.composer-area').classList.toggle('is-clarifying', !!clarification);
     $('empty-state').hidden = !!run; $('thread').hidden = !run;
     $('chat-title').textContent = run?.goal || 'New chat';
     $('chat-title').title = run?.goal || '';
     $('export-run').hidden = !run;
     $('chat-status').hidden = !run;
     $('chat-status').textContent = run ? `${statusLabel(run.status)}${run.status === 'running' ? ` · ${elapsed(run)}` : ''}` : '';
+    renderProgress(run);
     $('goal').placeholder = run ? 'Ask a follow-up…' : 'Ask Codex and Claude…';
     $('live-status').hidden = !run || run.status !== 'running';
     if (run?.status === 'running') $('live-status-text').textContent = `${phaseNames[run.phase] || 'Working through the question'}…`;
     $('run-error').hidden = !run?.storageWarning; $('run-error').textContent = run?.storageWarning || '';
     if (run) renderThread(run);
     renderSources(); updateControls();
-    if (run && autoScroll && !scrollScheduled) {
+    const panelKey = clarification ? `${run.id}:${clarification.id}` : null;
+    if (panelKey && clarificationScrollKey !== panelKey) {
+      clarificationScrollKey = panelKey; autoScroll = false; $('jump-latest').hidden = true;
+      requestAnimationFrame(() => {
+        if (state.selectedRunId !== run.id || pendingClarification()?.id !== clarification.id) return;
+        const scroller = $('chat-scroll');
+        const panel = [...turnNodes.values()].find(entry => entry.clarification.dataset.clarificationId === clarification.id)?.clarification;
+        if (panel) scroller.scrollTop += panel.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 24;
+      });
+    } else if (run && !clarification && autoScroll && !scrollScheduled) {
       scrollScheduled = true; const id = run.id;
       requestAnimationFrame(() => { scrollScheduled = false; if (autoScroll && state.selectedRunId === id) $('chat-scroll').scrollTop = $('chat-scroll').scrollHeight; });
     }
@@ -771,8 +1039,8 @@
   function selectRun(id) {
     state.selectedRunId = id;
     state.defaultsMessage = '';
-    messageNodes.clear(); turnNodes.clear(); $('thread').replaceChildren();
-    closePreview(); toggleSettings(false); autoScroll = true;
+    messageNodes.clear(); turnNodes.clear(); reviewGroups.clear(); $('thread').replaceChildren();
+    closePreview(); toggleSettings(false); autoScroll = true; clarificationScrollKey = null;
     $('goal').value = currentDraft().text;
     renderModels(); renderHistory(); renderView();
     if (!id) $('goal').focus();
@@ -799,7 +1067,7 @@
     event?.preventDefault();
     const draft = currentDraft(); const run = selectedRun();
     const ready = ['codex', 'claude'].every((provider) => state.providers[provider]?.available && state.providers[provider]?.compatible !== false && state.providers[provider]?.authenticated === true);
-    if (!draft.text.trim() || state.starting || !state.preferencesLoaded || state.attachmentsBusy || providerSetupPending() || activeRun() || !ready || !moderatorAvailable() || sourceLimit()) return;
+    if (!draft.text.trim() || pendingClarification(run) || state.starting || !state.preferencesLoaded || state.attachmentsBusy || providerSetupPending() || activeRun() || !ready || !moderatorAvailable() || sourceLimit()) return;
     const input = { goal: draft.text.trim(), attachmentIds: draft.files.map((file) => file.id), codexModel: draft.models.codex, claudeModel: draft.models.claude, moderatorModel: draft.models.moderator, timeoutMinutes: draft.timeoutMinutes };
     state.starting = true; draft.error = ''; updateControls(); renderModels();
     try {
@@ -817,6 +1085,11 @@
   $('goal-form').addEventListener('submit', sendMessage);
   $('goal').addEventListener('input', () => { currentDraft().text = $('goal').value; updateControls(); });
   $('new-chat').addEventListener('click', () => selectRun(null));
+  for (const button of document.querySelectorAll('.sample-prompt')) button.addEventListener('click', () => {
+    const draft = currentDraft();
+    if (draft.text.trim()) { $('goal').focus(); return; }
+    draft.text = button.dataset.prompt; $('goal').value = draft.text; $('goal').focus(); updateControls();
+  });
   $('view-active').addEventListener('click', () => { const run = activeRun(); if (run) selectRun(run.id); });
   $('attach-files').addEventListener('click', pickSources);
   $('clear-attachment-errors').addEventListener('click', () => { currentDraft().errors = []; renderSources(); });
@@ -829,8 +1102,8 @@
   $('save-defaults').addEventListener('click', saveDefaults);
   $('export-run').addEventListener('click', exportRun);
   $('stop-active-run').addEventListener('click', async () => {
-    const run = activeRun(); if (!run) return; $('stop-active-run').disabled = true;
-    try { await bridge.stopRun(run.id); }
+    const run = activeRun() || (pendingClarification() ? selectedRun() : null); if (!run) return; $('stop-active-run').disabled = true;
+    try { const result = await bridge.stopRun(run.id); if (result?.id) onRunUpdate(result); }
     catch (error) { toast(errorText(error)); updateControls(); }
   });
   $('refresh-providers').addEventListener('click', () => refreshConnections());
@@ -842,13 +1115,13 @@
   $('connections-dialog').addEventListener('close', () => { const target = connectionsReturnFocus?.isConnected ? connectionsReturnFocus : $('open-connections'); target.focus(); connectionsReturnFocus = null; });
   $('chat-scroll').addEventListener('scroll', () => {
     const scroller = $('chat-scroll'); autoScroll = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 100;
-    $('jump-latest').hidden = autoScroll || !selectedRun();
+    $('jump-latest').hidden = autoScroll || !selectedRun() || !!pendingClarification();
   }, { passive: true });
-  $('jump-latest').addEventListener('click', () => { autoScroll = true; $('chat-scroll').scrollTo({ top: $('chat-scroll').scrollHeight, behavior: 'smooth' }); $('jump-latest').hidden = true; });
+  $('jump-latest').addEventListener('click', () => { autoScroll = true; $('chat-scroll').scrollTo({ top: $('chat-scroll').scrollHeight, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); $('jump-latest').hidden = true; });
   document.addEventListener('keydown', (event) => {
     if ($('connections-dialog').open) { if (event.key === 'Escape') { event.preventDefault(); closeConnections(); } return; }
     if (event.key === 'Escape') { closePreview(); toggleSettings(false); }
-    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); sendMessage(); }
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); const clarification = pendingClarification(); if (clarification) answerClarification(state.selectedRunId, clarification, false); else sendMessage(); }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'n') { event.preventDefault(); selectRun(null); }
   });
   $('reload-app').addEventListener('click', () => window.location.reload());

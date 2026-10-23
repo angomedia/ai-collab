@@ -7,6 +7,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Council } from '../src/main/orchestrator.mjs';
 
 function moderatorResponse(prompt) {
+  if (prompt.includes('PHASE: CLARIFICATION')) return { text: JSON.stringify({ needsClarification: false, reason: 'The question is sufficiently specified.', questions: [] }) };
+  if (prompt.includes('PHASE: KNOWLEDGE')) return { text: JSON.stringify({ needsResearch: false, unfamiliar: [], queries: [] }) };
   if (prompt.includes('PHASE: PLANNING')) return { text: JSON.stringify({ refinedQuestion: 'Preserve the user goal and provide a reliable answer.', mode: 'complementary', rationale: 'Examine evidence and practical constraints independently.', roles: { codex: { label: 'Evidence analyst', instructions: 'Examine the available evidence and assumptions.' }, claude: { label: 'Practical reviewer', instructions: 'Check feasibility and implementation risks.' } } }) };
   if (prompt.includes('PHASE: ADJUDICATION')) return { text: JSON.stringify({ candidate_version: 1, action: 'finalize', reason: 'Both reviews are valid and the exact candidate answers the question.', revisionInstructions: [], remainingDisagreements: [] }) };
   return null;

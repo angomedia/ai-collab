@@ -8,6 +8,7 @@ import { discoverModels, invalidateModels } from './models.mjs';
 import { AttachmentStore } from './attachments.mjs';
 import { createConnectionManager } from './connections.mjs';
 import { applyQuestionPreferences, createPreferencesStore } from './preferences.mjs';
+import { summarizeResponse } from './summaries.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const APP_URL = 'collab://app/index.html';
@@ -128,7 +129,7 @@ function publicRun(run) {
   return { ...run, attachments: (run.attachments || []).map(({ text, sha256, ...metadata }) => metadata) };
 }
 
-async function prepareQuestion(input, previous = null) {
+async function prepareQuestion(input, previous = null, { resuming = false } = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Enter a question first.');
   if ([...pendingSetups.values()].some(setup => !setup.completed)) throw new Error(`Finish or cancel setup in ${setupTerminal}, then refresh status before starting a discussion.`);
   const sourceDocuments = attachments.resolve(input.attachmentIds ?? []);
@@ -151,7 +152,9 @@ async function prepareQuestion(input, previous = null) {
   }
   // The moderator is a separate role and model, using the same Codex subscription login.
   if (!models.codex?.options.some(option => option.id === effective.moderatorModel)) {
-    throw new Error(`The moderator model “${effective.moderatorModel}” is not in the current Codex model list. Open Models & time to refresh or select another moderator model.`);
+    throw new Error(`The moderator model “${effective.moderatorModel}” is not in the current Codex model list. ${resuming
+      ? 'This paused question keeps its original models. Restore access and refresh models, or stop this question and resend it with another moderator model.'
+      : 'Open Models & time to refresh or select another moderator model.'}`);
   }
   if ([...pendingSetups.values()].some(setup => !setup.completed)) throw new Error(`Finish or cancel setup in ${setupTerminal}, then refresh status before starting a discussion.`);
   return { ...effective, attachments: sourceDocuments };
@@ -172,7 +175,7 @@ async function initialize() {
       'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'",
     } });
   });
-  council = new Council({ runProvider, storageDir: path.join(app.getPath('userData'), 'debates') });
+  council = new Council({ runProvider, summarizeResponse, storageDir: path.join(app.getPath('userData'), 'debates') });
   await council.init();
   attachments = new AttachmentStore({
     storageDir: path.join(app.getPath('userData'), 'attachments'),
@@ -226,6 +229,16 @@ async function initialize() {
     const previous = typeof id === 'string' && council.getRun(id);
     if (!previous) throw new Error('This conversation was not found.');
     return publicRun(await council.followUp(id, await prepareQuestion(input, previous)));
+  });
+  handle('council:clarification-answer', async (id, input) => {
+    const previous = typeof id === 'string' && council.getRun(id);
+    if (!previous || previous.status !== 'awaiting_input') throw new Error('This conversation is no longer waiting for an answer.');
+    // A pause can outlive account setup or an app restart. Recheck connections and
+    // the original model choices before resuming, without replacing source snapshots.
+    await prepareQuestion({ goal: previous.currentQuestion, attachmentIds: [],
+      codexModel: previous.models.codex, claudeModel: previous.models.claude,
+      moderatorModel: previous.models.moderator, timeoutMinutes: previous.timeoutMinutes }, previous, { resuming: true });
+    return publicRun(await council.answerClarification(id, input));
   });
   handle('council:stop', async id => publicRun(await council.stop(id)));
   handle('council:copy', text => {

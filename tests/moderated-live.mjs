@@ -18,7 +18,8 @@ source.charCount = source.text.length;
 const council = new Council({ storageDir: temporary, runProvider: async input => {
   const phase = input.prompt.match(/PHASE:\s*(\w+)/)?.[1];
   const turn = Number(input.prompt.match(/TURN_NUMBER:\s*(\d+)/)?.[1]);
-  assert.ok(input.prompt.includes(source.text), 'every role receives the entire attachment');
+  // Search-enabled research calls deliberately never receive attachments.
+  assert.equal(input.prompt.includes(source.text), phase !== 'RESEARCH', 'every role except web research receives the entire attachment');
   if (phase === 'PLANNING' || phase === 'ADJUDICATION') {
     assert.equal(input.provider, 'codex');
     assert.equal(input.model, 'gpt-6-sol');

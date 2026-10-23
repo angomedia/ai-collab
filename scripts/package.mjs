@@ -2,7 +2,7 @@ import { packager } from '@electron/packager';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, rm } from 'node:fs/promises';
 import { buildDocumentReader } from './build-document-reader.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -22,6 +22,14 @@ const results = await packager({
   asar: { unpack: '**/*.node' },
   extraResource: helper ? [helper] : [],
   prune: true,
+  afterPrune: [async ({ buildPath }) => {
+    // Packager's dependency pruner can retain package directories despite ignore.
+    // Remove optional Claude binaries from the copy, never the developer's modules.
+    const scope = path.join(buildPath, 'node_modules', '@anthropic-ai');
+    const packages = await readdir(scope);
+    await Promise.all(packages.filter(name => name.startsWith('claude-agent-sdk-'))
+      .map(name => rm(path.join(scope, name), { recursive: true, force: true })));
+  }],
   ...(process.platform === 'darwin' && existsSync(icon) ? { icon } : {}),
   ignore: [/^\/dist(?:\/|$)/, /^\/tests(?:\/|$)/, /^\/test-results(?:\/|$)/, /^\/outputs(?:\/|$)/, /^\/scripts(?:\/|$)/, /^\/resources(?:\/|$)/, /^\/\.git(?:hub)?(?:\/|$)/,
     /^\/node_modules\/@anthropic-ai\/claude-agent-sdk-[^/]+(?:\/|$)/],

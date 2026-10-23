@@ -4,10 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
-import { Council, exportMarkdown, parsePlan, parseAdjudication, validatePlan, validateAdjudication, PLAN_OUTPUT_SCHEMA, adjudicationOutputSchema, DEFAULT_MODERATOR_MODEL } from '../src/main/orchestrator.mjs';
+import { Council, exportMarkdown, parsePlan, parseAdjudication, parseKnowledgeCheck, parseClarification, validateClarification, CLARIFICATION_OUTPUT_SCHEMA, validatePlan, validateAdjudication, PLAN_OUTPUT_SCHEMA, adjudicationOutputSchema, DEFAULT_MODERATOR_MODEL } from '../src/main/orchestrator.mjs';
 
 const TERMINAL = new Set(['completed', 'cancelled', 'timed_out', 'failed', 'interrupted']);
-const phaseOf = prompt => /PHASE:\s*(PLANNING|ANALYSIS|CRITIQUE|SYNTHESIS|REVISION|REVIEW|ADJUDICATION)\b/.exec(prompt)?.[1];
+const phaseOf = prompt => /PHASE:\s*(CLARIFICATION|KNOWLEDGE|RESEARCH|PLANNING|ANALYSIS|CRITIQUE|SYNTHESIS|REVISION|REVIEW|ADJUDICATION)\b/.exec(prompt)?.[1];
+const sufficient = () => ({ text: JSON.stringify({ needsClarification: false, reason: 'The question supplies enough context for a useful discussion.', questions: [] }) });
+const knows = (unfamiliar = [], queries = []) => ({ text: JSON.stringify({ needsResearch: unfamiliar.length > 0, unfamiliar, queries }) });
 const versionOf = prompt => Number(/CANDIDATE_VERSION:\s*(\d+)/.exec(prompt)?.[1]);
 const turnOf = prompt => Number(/TURN_NUMBER:\s*(\d+)/.exec(prompt)?.[1] || 1);
 const vote = (version, verdict = 'approve', issues = [], suggestions = [], summary = '') => JSON.stringify({ candidate_version: version, verdict, issues, suggestions, summary });
@@ -26,18 +28,26 @@ async function until(getValue, description, timeoutMs = 5000) {
 async function finish(council, id) {
   return until(() => { const run = council.getRun(id); return run && TERMINAL.has(run.status) && council.activeRunId !== id && run; }, 'discussion completion and flush');
 }
-async function harness(t, implementation, options = {}) {
+async function harness(t, implementation, { knowledge = () => knows(), clarification = () => sufficient(), ...options } = {}) {
   const storageDir = await mkdtemp(path.join(os.tmpdir(), 'ai-council-test-'));
-  const calls = [], events = [];
-  const council = new Council({ storageDir, ...options, runProvider: async request => { calls.push(request); return implementation(request); } });
+  const calls = [], events = [], checks = [], clarifications = [];
+  // Knowledge checks precede every question. They are recorded separately so debate tests keep their
+  // exact call order; web research tests supply their own knowledge responses.
+  const council = new Council({ storageDir, ...options, runProvider: async request => {
+    if (phaseOf(request.prompt) === 'CLARIFICATION') { clarifications.push(request); return clarification(request); }
+    if (phaseOf(request.prompt) === 'KNOWLEDGE') { checks.push(request); return knowledge(request); }
+    calls.push(request); return implementation(request);
+  } });
   council.on('run-updated', run => events.push(structuredClone(run)));
   await council.init();
   t.after(async () => { await council.close(); await rm(storageDir, { recursive: true, force: true }); });
-  return { council, storageDir, calls, events };
+  return { council, storageDir, calls, events, checks, clarifications };
 }
 function basicProvider(request) {
   const phase = phaseOf(request.prompt), turn = turnOf(request.prompt);
   assert.ok(phase, 'provider prompt identifies its phase');
+  if (phase === 'CLARIFICATION') return sufficient();
+  if (phase === 'KNOWLEDGE') return knows();
   if (phase === 'PLANNING') return { text: JSON.stringify(planFor(turn)) };
   if (phase === 'ADJUDICATION') {
     const reviews = JSON.parse(/INDEPENDENT_REVIEWS_JSON:\n([^\n]+)/.exec(request.prompt)[1]);
@@ -593,4 +603,424 @@ test('terminal planner failure retains a precise error and never claims cancella
   assert.ok(run.messages.every(message => message.failureKind === 'validation' && message.validationError.code === 'invalid_json'));
   assert.deepEqual(run.messages.map(message => message.validationError.attempt), [1, 2]);
   assert.ok(!JSON.stringify(run).includes('PRIVATE_INVALID_PLAN'));
+});
+
+test('knowledge checks are read leniently but never invent research requests', () => {
+  assert.deepEqual(parseKnowledgeCheck('{"needsResearch":false,"unfamiliar":[],"queries":[]}'), { needsResearch: false, unfamiliar: [], queries: [] });
+  assert.deepEqual(parseKnowledgeCheck('```json\n{"needsResearch":true,"unfamiliar":[" iPhone Duo ","iPhone Duo"],"queries":["Apple iPhone Duo foldable"]}\n```'),
+    { needsResearch: true, unfamiliar: ['iPhone Duo'], queries: ['Apple iPhone Duo foldable'] });
+  assert.equal(parseKnowledgeCheck('{"needsResearch":false,"unfamiliar":["Zorblax 9"],"queries":[]}').needsResearch, true, 'naming an unfamiliar item requests research');
+  assert.deepEqual(parseKnowledgeCheck('{"needsResearch":false,"unfamiliar":[],"queries":["unrequested search"]}').queries, []);
+  assert.equal(parseKnowledgeCheck('{"needsResearch":true,"unfamiliar":["a","b","c","d","e","f","g"]}').unfamiliar.length, 5);
+  assert.deepEqual(parseKnowledgeCheck(`{"needsResearch":true,"unfamiliar":["${'x'.repeat(201)}"],"queries":["ok"]}`).unfamiliar, []);
+  for (const invalid of ['I know this topic.', '', '[]', '{"needsResearch":"yes"}', '{"needsResearch":true,"unfamiliar":"iPhone Duo"}', '{"needsResearch":true,"queries":[3]}']) assert.equal(parseKnowledgeCheck(invalid), null, invalid);
+});
+
+test('an assistant that does not recognize the question searches the web and both share the findings', async (t) => {
+  const source = documentSource();
+  const { council, calls, checks } = await harness(t, request => phaseOf(request.prompt) === 'RESEARCH'
+    ? { text: 'The iPhone Duo is RESEARCH_BRIEF_4471.\n\nSources: https://example.com/duo' }
+    : basicProvider(request), { knowledge: request => request.provider === 'claude' ? knows(['iPhone Duo'], ['Apple iPhone Duo foldable']) : knows() });
+  const initial = await council.start({ goal: 'Should I buy the iPhone Duo?', attachments: [source], codexModel: 'codex-test', claudeModel: 'claude-test' });
+  const run = await finish(council, initial.id);
+  assert.equal(run.status, 'completed');
+  assert.deepEqual(checks.map(call => call.provider).sort(), ['claude', 'codex']);
+  for (const check of checks) {
+    assert.ok(check.prompt.includes(source.text), 'knowledge checks see the attached sources as known context');
+    assert.equal(Object.hasOwn(check, 'webSearch'), false);
+  }
+  const research = calls.filter(call => phaseOf(call.prompt) === 'RESEARCH');
+  assert.equal(research.length, 1, 'only the assistant that lacked knowledge searches');
+  assert.equal(research[0].provider, 'claude'); assert.equal(research[0].model, 'claude-test'); assert.equal(research[0].webSearch, true);
+  assert.ok(research[0].prompt.includes('"iPhone Duo"')); assert.ok(research[0].prompt.includes('"Apple iPhone Duo foldable"'));
+  assert.ok(research[0].prompt.includes('Should I buy the iPhone Duo?'));
+  assert.ok(!research[0].prompt.includes(source.text), 'a search-enabled call never receives attachment text');
+  assert.ok(calls.filter(call => call !== research[0]).every(call => !Object.hasOwn(call, 'webSearch')), 'web search is enabled only for research');
+  assert.equal(phaseOf(calls[1].prompt), 'PLANNING', 'research finishes before the moderator plans');
+  for (const call of calls.slice(1)) {
+    assert.ok(call.prompt.includes('RESEARCH_BRIEF_4471'), `${phaseOf(call.prompt)} receives the research findings`);
+    assert.ok(call.prompt.includes('Looked up: iPhone Duo'));
+  }
+  const message = run.messages.find(item => item.kind === 'research');
+  assert.equal(message.provider, 'claude'); assert.equal(message.status, 'completed'); assert.deepEqual(message.lookup, ['iPhone Duo']);
+  assert.ok(message.text.startsWith('The iPhone Duo is RESEARCH_BRIEF_4471'));
+  assert.equal(run.messages[0], message, 'research is shown before the moderator plan');
+  assert.ok(!run.messages.some(item => item.kind === 'knowledge'), 'knowledge checks stay out of the transcript');
+  assert.ok(exportMarkdown(run).includes('RESEARCH_BRIEF_4471'));
+});
+
+test('when both assistants lack knowledge, both search independently', async (t) => {
+  const { council, calls } = await harness(t, request => phaseOf(request.prompt) === 'RESEARCH' ? { text: `${request.provider} findings.` } : basicProvider(request),
+    { knowledge: request => knows([`${request.provider} unknown`]) });
+  const run = await finish(council, (await council.start({ goal: 'Compare two new things.' })).id);
+  assert.equal(run.status, 'completed');
+  const research = calls.filter(call => phaseOf(call.prompt) === 'RESEARCH');
+  assert.deepEqual(research.map(call => call.provider).sort(), ['claude', 'codex']);
+  assert.ok(research.every(call => call.webSearch === true && call.prompt.includes(`"${call.provider} unknown"`)));
+  const plan = calls.find(call => phaseOf(call.prompt) === 'PLANNING');
+  assert.ok(plan.prompt.includes('codex findings.') && plan.prompt.includes('claude findings.'));
+});
+
+test('a failed web search is shown but does not stop the discussion', async (t) => {
+  const { council, calls } = await harness(t, request => {
+    if (phaseOf(request.prompt) === 'RESEARCH') throw new Error('Web search is unavailable for this account.');
+    return basicProvider(request);
+  }, { knowledge: request => request.provider === 'codex' ? knows(['Obscure Product X']) : knows() });
+  const run = await finish(council, (await council.start({ goal: 'Is Obscure Product X worth it?' })).id);
+  assert.equal(run.status, 'completed'); assert.equal(run.final.consensus, true);
+  const message = run.messages.find(item => item.kind === 'research');
+  assert.equal(message.status, 'failed'); assert.equal(message.failureKind, 'provider');
+  assert.match(message.text, /could not be completed.*Web search is unavailable/);
+  const plan = calls.find(call => phaseOf(call.prompt) === 'PLANNING');
+  assert.ok(plan.prompt.includes('Web research could not be completed'), 'peers know the research is missing');
+});
+
+test('unreadable knowledge checks request no research and the discussion proceeds', async (t) => {
+  const { council, calls, checks } = await harness(t, basicProvider, { knowledge: () => ({ text: 'I know what this is.' }) });
+  const run = await finish(council, (await council.start({ goal: 'Plan a weekly budget.' })).id);
+  assert.equal(run.status, 'completed'); assert.equal(checks.length, 2);
+  assert.ok(!calls.some(call => phaseOf(call.prompt) === 'RESEARCH'));
+  assert.equal(phaseOf(calls[0].prompt), 'PLANNING');
+});
+
+test('stopping during web research ends the question before planning', async (t) => {
+  const { council, calls } = await harness(t, request => phaseOf(request.prompt) === 'RESEARCH' ? blockUntilAborted(request) : basicProvider(request),
+    { knowledge: request => request.provider === 'claude' ? knows(['Something new']) : knows() });
+  const initial = await council.start({ goal: 'What is Something new?' });
+  await until(() => council.getRun(initial.id)?.phase === 'research' && calls.length === 1, 'web research to start');
+  await council.stop(initial.id);
+  const run = await finish(council, initial.id);
+  assert.equal(run.status, 'cancelled');
+  assert.ok(!calls.some(call => phaseOf(call.prompt) === 'PLANNING'));
+  assert.equal(run.messages.find(item => item.kind === 'research').failureKind, 'cancelled');
+});
+
+test('follow-ups check knowledge again with earlier research as context', async (t) => {
+  const { council, checks } = await harness(t, request => phaseOf(request.prompt) === 'RESEARCH' ? { text: 'EARLIER_FINDINGS_2210' } : basicProvider(request),
+    { knowledge: request => turnOf(request.prompt) === 1 && request.provider === 'claude' ? knows(['iPhone Duo']) : knows() });
+  const initial = await council.start({ goal: 'Should I buy the iPhone Duo?' });
+  await finish(council, initial.id);
+  await council.followUp(initial.id, { goal: 'What about its battery?' });
+  const run = await finish(council, initial.id);
+  assert.equal(run.status, 'completed'); assert.equal(run.turns.length, 2); assert.equal(checks.length, 4);
+  assert.ok(checks.filter(call => turnOf(call.prompt) === 2).every(call => call.prompt.includes('EARLIER_FINDINGS_2210')));
+  assert.equal(run.messages.filter(item => item.kind === 'research').length, 1);
+});
+
+const missingContext = (questions = [
+  { id: 'budget', question: 'What is the maximum budget you can commit?', options: ['Under $500', '$500–$1,000', 'Over $1,000'] },
+  { id: 'priority', question: 'Which outcome matters most to you?', options: [] },
+]) => ({ needsClarification: true, reason: 'Budget and priorities materially change which option is appropriate.', questions });
+const askContext = () => ({ text: JSON.stringify(missingContext()) });
+async function paused(council, id) {
+  return until(() => { const run = council.getRun(id); return run?.status === 'awaiting_input' && council.activeRunId !== id && run; }, 'durable clarification pause');
+}
+const answerInput = run => ({ clarificationId: run.clarification.id, answers: [{ id: 'budget', answer: '$420 TOTAL_BUDGET' }, { id: 'priority', answer: 'Reliability PRIORITY_MARKER' }] });
+
+test('clarification schema rejects contradictory, duplicate, excessive, malformed and unbounded questions', () => {
+  assert.deepEqual(parseClarification(JSON.stringify(missingContext())), missingContext());
+  assert.equal(parseClarification(sufficient().text).needsClarification, false);
+  for (const value of [
+    { ...missingContext(), needsClarification: 'true' }, { ...missingContext(), needsClarification: false },
+    { ...missingContext(), questions: [] }, { ...missingContext(), unknown: true },
+    { ...missingContext(), reason: '' }, { ...missingContext(), reason: 'x'.repeat(2001) },
+    missingContext(Array.from({ length: 4 }, (_, i) => ({ id: `q${i}`, question: `Question ${i}`, options: [] }))),
+    missingContext([{ id: 'bad id', question: 'A question?', options: [] }]),
+    missingContext([{ id: 'q1', question: 'A question?', options: [] }, { id: 'q1', question: 'Different question?', options: [] }]),
+    missingContext([{ id: 'q1', question: 'A question?', options: [] }, { id: 'q2', question: ' A QUESTION? ', options: [] }]),
+    missingContext([{ id: 'q1', question: 'x'.repeat(1001), options: [] }]),
+    missingContext([{ id: 'q1', question: 'A question?', options: ['', 'Other'] }]),
+    missingContext([{ id: 'q1', question: 'A question?', options: ['Yes', ' yes '] }]),
+    missingContext([{ id: 'q1', question: 'A question?', options: ['x'.repeat(301)] }]),
+    missingContext([{ id: 'q1', question: 'A question?', options: ['1', '2', '3', '4', '5', '6'] }]),
+  ]) assert.equal(parseClarification(JSON.stringify(value)), null, JSON.stringify(value));
+  assert.equal(validateClarification('{"needsClarification":').error.code, 'invalid_json');
+  assert.equal(validateClarification('x'.repeat(16001)).error.code, 'response_too_long');
+});
+
+test('sufficient context checks the moderator once before knowledge without cluttering the transcript', async t => {
+  const order = [];
+  const { council, clarifications, events } = await harness(t, request => { order.push(phaseOf(request.prompt)); return basicProvider(request); }, {
+    clarification: request => { order.push(phaseOf(request.prompt)); return sufficient(); },
+    knowledge: request => { order.push(phaseOf(request.prompt)); return knows(); },
+  });
+  const run = await finish(council, (await council.start({ goal: 'Explain a fully specified question.', moderatorModel: 'gpt-6.1-sol' })).id);
+  assert.deepEqual(order.slice(0, 4), ['CLARIFICATION', 'KNOWLEDGE', 'KNOWLEDGE', 'PLANNING']);
+  assert.equal(clarifications.length, 1); assert.equal(clarifications[0].provider, 'codex'); assert.equal(clarifications[0].model, 'gpt-6.1-sol');
+  assert.deepEqual(clarifications[0].outputSchema, CLARIFICATION_OUTPUT_SCHEMA);
+  assert.equal(run.clarification.status, 'not_needed'); assert.deepEqual(run.clarification, run.turns[0].clarification);
+  assert.equal(run.messages[0].kind, 'planning'); assert.ok(!events.some(event => event.status === 'awaiting_input'));
+  assert.match(clarifications[0].prompt, /Do not ask the user to\nresolve public facts/);
+});
+
+test('missing context pauses durably before research and resumes the same turn with answers everywhere', async t => {
+  const source = documentSource();
+  const { council, storageDir, calls, checks, clarifications } = await harness(t, request => phaseOf(request.prompt) === 'RESEARCH' ? { text: 'New product facts.' } : basicProvider(request), {
+    clarification: askContext, knowledge: () => knows(['New product'], ['Product facts']),
+  });
+  const initial = await council.start({ goal: 'Choose an option for my situation.', attachments: [source] });
+  const waiting = await paused(council, initial.id);
+  assert.equal(calls.length, 0); assert.equal(checks.length, 0); assert.equal(clarifications.length, 1);
+  assert.equal(council.controllers.size, 0); assert.equal(council.tasks.size, 0);
+  assert.equal(waiting.phase, 'awaiting_input'); assert.equal(waiting.clarification.status, 'pending');
+  assert.equal(waiting.turns[0].completedAt, undefined); assert.equal(waiting.final, null);
+  const disk = JSON.parse(await readFile(path.join(storageDir, 'runs', `${initial.id}.json`), 'utf8'));
+  assert.equal(disk.status, 'awaiting_input'); assert.deepEqual(disk.clarification, waiting.clarification);
+  assert.ok(clarifications[0].prompt.includes(source.text));
+  assert.equal(waiting.messages[0].kind, 'clarification'); assert.equal(waiting.messages[0].provider, 'moderator');
+  const input = answerInput(waiting);
+  const resumed = await council.answerClarification(initial.id, input);
+  input.answers[0].answer = 'MUTATED_CALLER_ANSWER';
+  assert.equal(resumed.id, initial.id); assert.equal(resumed.turnId, initial.turnId); assert.equal(resumed.turns.length, 1);
+  const run = await finish(council, initial.id);
+  assert.equal(run.final.consensus, true); assert.equal(clarifications.length, 1);
+  assert.equal(run.clarification.status, 'answered'); assert.equal(run.clarification.answers[0].answer, '$420 TOTAL_BUDGET');
+  for (const request of [...checks, ...calls]) {
+    assert.ok(request.prompt.includes('TOTAL_BUDGET'), `${phaseOf(request.prompt)} sees budget`);
+    assert.ok(request.prompt.includes('PRIORITY_MARKER'), `${phaseOf(request.prompt)} sees priority`);
+    if (phaseOf(request.prompt) !== 'RESEARCH') assert.ok(request.prompt.includes(source.text));
+  }
+  const exported = exportMarkdown(run);
+  assert.match(exported, /What is the maximum budget/); assert.match(exported, /TOTAL_BUDGET/); assert.match(exported, /PRIORITY_MARKER/);
+  assert.ok(!exported.includes('needsClarification')); assert.ok(!exported.includes('MUTATED_CALLER_ANSWER'));
+});
+
+test('clarification answer validation rejects stale, missing, duplicate, unknown and invalid answers without changing the pause', async t => {
+  const { council, calls } = await harness(t, basicProvider, { clarification: askContext });
+  const waiting = await paused(council, (await council.start({ goal: 'Need my context.' })).id);
+  const valid = answerInput(waiting);
+  for (const input of [
+    { ...valid, clarificationId: 'stale' }, { ...valid, answers: [] }, { ...valid, answers: [{ id: 'budget', answer: 'Yes' }] },
+    { ...valid, answers: [{ id: 'budget', answer: 'Yes' }, { id: 'budget', answer: 'No' }] },
+    { ...valid, answers: [{ id: 'unknown', answer: 'No' }] },
+    { ...valid, answers: [{ id: 'budget', answer: ' ' }], useAssumptions: true },
+    { ...valid, answers: [{ id: 'budget', answer: 'x'.repeat(4001) }], useAssumptions: true },
+    { ...valid, answers: [{ id: 'budget', answer: 'x\0y' }], useAssumptions: true },
+    { ...valid, useAssumptions: 'yes' },
+  ]) await assert.rejects(council.answerClarification(waiting.id, input));
+  assert.deepEqual(council.getRun(waiting.id), waiting); assert.equal(calls.length, 0); assert.equal(council.activeRunId, null);
+  await assert.rejects(council.followUp(waiting.id, { goal: 'Skip silently.' }), /Answer the clarification/);
+});
+
+test('explicit assumptions may omit answers and remain visible in prompts, saved history and export', async t => {
+  const { council, calls, storageDir } = await harness(t, basicProvider, { clarification: askContext });
+  const waiting = await paused(council, (await council.start({ goal: 'Choose a useful approach.' })).id);
+  await council.answerClarification(waiting.id, { clarificationId: waiting.clarification.id, answers: [], useAssumptions: true });
+  const run = await finish(council, waiting.id);
+  assert.equal(run.clarification.status, 'assumptions'); assert.deepEqual(run.clarification.answers, []);
+  assert.ok(calls.every(request => request.prompt.includes('explicitly chose to continue with assumptions')));
+  assert.match(exportMarkdown(run), /explicitly chose to continue with assumptions/);
+  const disk = JSON.parse(await readFile(path.join(storageDir, 'runs', `${run.id}.json`), 'utf8'));
+  assert.equal(disk.turns[0].clarification.status, 'assumptions');
+});
+
+test('pause survives restart with no model call and human waiting does not consume the remaining compute budget', async t => {
+  let now = 100000;
+  const timers = new Map(), timeouts = [];
+  const clock = { setTimeout(callback, ms) { const id = {}; timers.set(id, callback); timeouts.push(ms); return id; }, clearTimeout(id) { timers.delete(id); } };
+  const { council, storageDir } = await harness(t, basicProvider, { now: () => new Date(now), timers: clock,
+    clarification: () => { now += 12000; return askContext(); } });
+  const waiting = await paused(council, (await council.start({ goal: 'Preserve the time remaining.', timeoutMinutes: 1 })).id);
+  assert.equal(waiting.remainingTimeMs, 48000); assert.equal(timers.size, 0); assert.deepEqual(timeouts, [60000]);
+  await council.close();
+  now += 7 * 24 * 60 * 60000;
+  const resumeCalls = [];
+  const reloaded = await new Council({ storageDir, now: () => new Date(now), timers: clock, runProvider: request => { resumeCalls.push(request); return basicProvider(request); } }).init();
+  assert.equal(resumeCalls.length, 0); assert.equal(reloaded.activeRunId, null); assert.equal(timers.size, 0);
+  assert.deepEqual(reloaded.getRun(waiting.id).clarification, waiting.clarification);
+  assert.equal(reloaded.getRun(waiting.id).status, 'awaiting_input');
+  await reloaded.answerClarification(waiting.id, answerInput(waiting));
+  const completed = await finish(reloaded, waiting.id);
+  assert.equal(completed.status, 'completed'); assert.deepEqual(timeouts, [60000, 48000]);
+  assert.ok(resumeCalls.every(request => phaseOf(request.prompt) !== 'CLARIFICATION' && request.timeoutMs === 48000));
+  assert.equal(timers.size, 0);
+  // Avoid the old instance overwriting this newly completed saved run at harness cleanup.
+  council.runs.set(waiting.id, structuredClone(completed));
+  await reloaded.close();
+});
+
+test('a paused chat releases the generation slot, duplicate resumes are rejected, and other chats remain intact', async t => {
+  let releaseAnalysis;
+  const gate = new Promise(resolve => { releaseAnalysis = resolve; });
+  t.after(() => releaseAnalysis());
+  const { council } = await harness(t, async request => { if (phaseOf(request.prompt) === 'ANALYSIS') await gate; return basicProvider(request); }, { clarification: askContext });
+  const first = await paused(council, (await council.start({ goal: 'First paused question.' })).id);
+  const second = await paused(council, (await council.start({ goal: 'Second paused question.' })).id);
+  const attempts = await Promise.allSettled([council.answerClarification(first.id, answerInput(first)), council.answerClarification(first.id, answerInput(first))]);
+  assert.equal(attempts.filter(result => result.status === 'fulfilled').length, 1);
+  assert.equal(attempts.filter(result => result.status === 'rejected').length, 1);
+  await assert.rejects(council.answerClarification(second.id, answerInput(second)), /already running/);
+  assert.equal(council.getRun(second.id).status, 'awaiting_input');
+  releaseAnalysis(); await finish(council, first.id);
+  await assert.rejects(council.answerClarification(first.id, answerInput(first)), /no longer waiting/);
+  await council.answerClarification(second.id, answerInput(second)); await finish(council, second.id);
+  assert.equal(council.listRuns().length, 2);
+});
+
+test('resuming a pause only starts inference after durable save and rolls back exactly when saving fails', async t => {
+  const { council, calls } = await harness(t, basicProvider, { clarification: askContext });
+  const waiting = await paused(council, (await council.start({ goal: 'Do not lose pending questions.' })).id);
+  const persist = council.persist.bind(council);
+  council.persist = async () => { throw new Error('ENOSPC resume test'); };
+  try { await assert.rejects(council.answerClarification(waiting.id, answerInput(waiting)), /Couldn't save/); }
+  finally { council.persist = persist; }
+  assert.deepEqual(council.getRun(waiting.id), waiting); assert.equal(calls.length, 0); assert.equal(council.activeRunId, null);
+  assert.equal(council.controllers.size, 0);
+  await council.answerClarification(waiting.id, answerInput(waiting)); assert.equal((await finish(council, waiting.id)).status, 'completed');
+});
+
+test('stopping a paused question cancels it durably without aborting another active chat', async t => {
+  const { council, storageDir } = await harness(t, request => phaseOf(request.prompt) === 'ANALYSIS' ? blockUntilAborted(request) : basicProvider(request), {
+    clarification: request => request.prompt.includes('Keep waiting') ? askContext() : sufficient(),
+  });
+  const waiting = await paused(council, (await council.start({ goal: 'Keep waiting for my details.' })).id);
+  const active = await council.start({ goal: 'Run another question.' });
+  await until(() => council.getRun(active.id).phase === 'analysis', 'other chat generating');
+  const stopped = await council.stop(waiting.id);
+  assert.equal(stopped.status, 'cancelled'); assert.equal(stopped.clarification.status, 'cancelled');
+  assert.equal(council.activeRunId, active.id); assert.equal(council.getRun(active.id).status, 'running');
+  await assert.rejects(council.answerClarification(waiting.id, answerInput(waiting)));
+  const disk = JSON.parse(await readFile(path.join(storageDir, 'runs', `${waiting.id}.json`), 'utf8'));
+  assert.equal(disk.status, 'cancelled'); assert.ok(disk.turns[0].completedAt);
+  await council.stop(active.id);
+});
+
+test('follow-ups get a fresh clarification check with all earlier answers, sources and final intact', async t => {
+  const source = documentSource();
+  const { council, clarifications } = await harness(t, basicProvider, { clarification: askContext });
+  const first = await paused(council, (await council.start({ goal: 'First decision.', attachments: [source] })).id);
+  await council.answerClarification(first.id, answerInput(first));
+  const completed = await finish(council, first.id), oldTurn = structuredClone(completed.turns[0]);
+  await council.followUp(first.id, { goal: 'Now consider a different option.' });
+  const second = await paused(council, first.id);
+  assert.equal(clarifications.length, 2); assert.notEqual(second.clarification.id, first.clarification.id);
+  assert.deepEqual(second.turns[0], oldTurn); assert.equal(second.turns.length, 2);
+  assert.ok(clarifications[1].prompt.includes('TOTAL_BUDGET')); assert.ok(clarifications[1].prompt.includes(completed.final.text));
+  assert.ok(clarifications[1].prompt.includes(source.text));
+  await council.stop(second.id);
+  assert.deepEqual(council.getRun(second.id).turns[0], oldTurn);
+});
+
+test('clarification repair gets the rejected response and precise error without storing raw JSON', async t => {
+  let count = 0;
+  const malformed = '{"needsClarification":true,"reason":"PRIVATE_RAW_PROTOCOL_MARKER"';
+  const { council, clarifications, storageDir } = await harness(t, basicProvider, { clarification: () => ++count === 1 ? { text: malformed } : askContext() });
+  const run = await paused(council, (await council.start({ goal: 'Ask the necessary question.' })).id);
+  assert.equal(clarifications.length, 2);
+  assert.ok(clarifications[1].prompt.includes('VALIDATION FIELD: $'));
+  assert.ok(clarifications[1].prompt.includes(JSON.stringify(malformed)));
+  assert.equal(run.messages[0].failureKind, 'validation'); assert.equal(run.messages[0].validationError.code, 'invalid_json');
+  assert.ok(!JSON.stringify(run).includes('PRIVATE_RAW_PROTOCOL_MARKER'));
+  assert.ok(!(await readFile(path.join(storageDir, 'runs', `${run.id}.json`), 'utf8')).includes('PRIVATE_RAW_PROTOCOL_MARKER'));
+  assert.ok(!exportMarkdown(run).includes('PRIVATE_RAW_PROTOCOL_MARKER'));
+});
+
+test('two invalid clarification attempts fail truthfully before knowledge, research or debate', async t => {
+  const { council, calls, checks, clarifications } = await harness(t, basicProvider, { clarification: () => ({ text: JSON.stringify({ ...missingContext(), questions: [] }) }) });
+  const run = await finish(council, (await council.start({ goal: 'Do not silently assume missing facts.' })).id);
+  assert.equal(run.status, 'failed'); assert.equal(run.final, null); assert.equal(run.clarification, null);
+  assert.equal(clarifications.length, 2); assert.equal(calls.length, 0); assert.equal(checks.length, 0);
+  assert.match(run.error, /No research or debate was started/);
+  assert.ok(run.messages.every(message => message.failureKind === 'validation'));
+});
+
+for (const action of ['stop', 'timeout']) test(`${action} during clarification aborts the moderator and never starts the debate`, async t => {
+  const deadline = manualDeadline(); let aborted = false;
+  const { council, calls, checks, clarifications } = await harness(t, basicProvider, { timers: deadline.timers,
+    clarification: request => blockUntilAborted(request, () => { aborted = true; }) });
+  const initial = await council.start({ goal: 'Cancel the context check.' });
+  await until(() => clarifications.length === 1, 'clarification started');
+  if (action === 'stop') await council.stop(initial.id); else deadline.fire();
+  const run = await finish(council, initial.id);
+  assert.equal(run.status, action === 'stop' ? 'cancelled' : 'timed_out'); assert.equal(aborted, true);
+  assert.equal(run.final, null); assert.equal(run.clarification, null); assert.equal(calls.length, 0); assert.equal(checks.length, 0);
+  assert.equal(run.messages[0].failureKind, run.status);
+});
+
+test('display summaries do not replace original text in context, candidate reviews or export', async t => {
+  const summaries = [];
+  const { council, calls } = await harness(t, basicProvider, { summarizeResponse: async request => {
+    summaries.push(request); return { headline: 'DISPLAY_ONLY_SUMMARY', points: ['A compact display point.'] };
+  } });
+  const run = await finish(council, (await council.start({ goal: 'Preserve the original arguments.' })).id);
+  assert.deepEqual(summaries.map(request => request.kind), ['analysis', 'critique', 'candidate']);
+  assert.ok(summaries.every(request => request.model === 'gpt-6-sol' && request.signal instanceof AbortSignal && request.timeoutMs > 0));
+  assert.equal(run.messages.find(message => message.kind === 'analysis').summary.headline, 'DISPLAY_ONLY_SUMMARY');
+  assert.ok(calls.every(request => !request.prompt.includes('DISPLAY_ONLY_SUMMARY')));
+  assert.ok(calls.filter(request => phaseOf(request.prompt) === 'REVIEW').every(request => request.prompt.includes(run.final.text)));
+  assert.ok(exportMarkdown(run).includes('codex analysis response')); assert.ok(!exportMarkdown(run).includes('DISPLAY_ONLY_SUMMARY'));
+});
+
+test('optional summary failures preserve the original answer but global cancellation still stops execution', async t => {
+  let enteredSummary = false;
+  const { council } = await harness(t, basicProvider, { summarizeResponse: request => {
+    if (request.kind !== 'candidate') throw new Error('Optional display summary unavailable');
+    enteredSummary = true; return blockUntilAborted(request);
+  } });
+  const initial = await council.start({ goal: 'Stop while the optional summary is generated.' });
+  await until(() => enteredSummary, 'candidate summary started');
+  await council.stop(initial.id);
+  const run = await finish(council, initial.id);
+  assert.equal(run.status, 'cancelled'); assert.equal(run.final.consensus, false); assert.equal(run.final.reviewed, false);
+  assert.equal(run.final.partial, false, 'the candidate text finished before display summarization was interrupted');
+  assert.ok(run.final.text.includes('Answer for question 1'));
+  assert.ok(!run.messages.some(message => message.kind === 'review'));
+});
+
+test('a response submitted from the pause event resumes exactly once after the old task settles', async t => {
+  const { council, clarifications } = await harness(t, basicProvider, { clarification: askContext });
+  let resume;
+  council.on('run-updated', run => {
+    if (run.status === 'awaiting_input' && !resume) resume = council.answerClarification(run.id, answerInput(run));
+  });
+  const initial = await council.start({ goal: 'Answer immediately when the input form arrives.' });
+  const completed = await finish(council, initial.id);
+  await resume;
+  assert.equal(completed.status, 'completed'); assert.equal(completed.turns.length, 1); assert.equal(clarifications.length, 1);
+  assert.equal(council.tasks.size, 0); assert.equal(council.controllers.size, 0);
+  assert.equal(completed.messages.filter(message => message.kind === 'clarification_answer').length, 1);
+});
+
+test('resumed execution is bounded by its remaining compute budget and times out truthfully', async t => {
+  let now = 100000;
+  const timers = new Map(), durations = [];
+  const clock = { setTimeout(callback, ms) { const id = {}; timers.set(id, callback); durations.push(ms); return id; }, clearTimeout(id) { timers.delete(id); } };
+  const { council } = await harness(t, request => phaseOf(request.prompt) === 'ANALYSIS' ? blockUntilAborted(request) : basicProvider(request), {
+    now: () => new Date(now), timers: clock, clarification: () => { now += 15000; return askContext(); },
+  });
+  const waiting = await paused(council, (await council.start({ goal: 'Keep the compute deadline across human input.', timeoutMinutes: 1 })).id);
+  now += 24 * 60 * 60000;
+  await council.answerClarification(waiting.id, answerInput(waiting));
+  await until(() => council.getRun(waiting.id).phase === 'analysis', 'resumed analysis');
+  assert.deepEqual(durations, [60000, 45000]);
+  now += 45000;
+  for (const callback of timers.values()) callback();
+  const run = await finish(council, waiting.id);
+  assert.equal(run.status, 'timed_out'); assert.equal(run.remainingTimeMs, 0);
+  assert.equal(run.clarification.status, 'answered'); assert.equal(run.final, null); assert.equal(timers.size, 0);
+});
+
+test('failed durable pause reports a storage warning and retains questions for recovery without inference', async t => {
+  const { council, calls, checks, events } = await harness(t, basicProvider, { clarification: askContext });
+  const persist = council.persist.bind(council);
+  council.persist = async run => {
+    if (run.status === 'awaiting_input') throw new Error('ENOSPC while saving the pause');
+    return persist(run);
+  };
+  try {
+    const waiting = await paused(council, (await council.start({ goal: 'Keep the questions if disk fills.' })).id);
+    assert.equal(calls.length, 0); assert.equal(checks.length, 0); assert.equal(waiting.clarification.status, 'pending');
+    assert.match(waiting.storageWarning, /could not be saved/i);
+    const published = events.filter(event => event.status === 'awaiting_input');
+    assert.equal(published.length, 1); assert.equal(published[0].storageWarning, waiting.storageWarning);
+  } finally { council.persist = persist; }
+});
+
+test('clarification provider failure is visible and cannot fall back to assumptions', async t => {
+  const { council, calls, checks } = await harness(t, basicProvider, { clarification: () => { throw new Error('Moderator account unavailable.'); } });
+  const run = await finish(council, (await council.start({ goal: 'Need a valid context check.' })).id);
+  assert.equal(run.status, 'failed'); assert.equal(run.clarification, null); assert.equal(run.final, null);
+  assert.equal(calls.length, 0); assert.equal(checks.length, 0);
+  assert.equal(run.messages[0].kind, 'clarification'); assert.equal(run.messages[0].failureKind, 'provider');
+  assert.match(run.messages[0].error, /account unavailable/);
 });

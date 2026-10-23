@@ -14,13 +14,13 @@ The app and Electron runtime are bundled. Codex and Claude Code are installed se
 To verify a download on Mac:
 
 ```sh
-shasum -a 256 AI-Collab-1.6.1-mac-arm64.dmg
+shasum -a 256 AI-Collab-1.7.0-mac-arm64.dmg
 ```
 
 On Windows PowerShell:
 
 ```powershell
-Get-FileHash .\AI-Collab-1.6.1-win-x64.exe -Algorithm SHA256
+Get-FileHash .\AI-Collab-1.7.0-win-x64.exe -Algorithm SHA256
 ```
 
 Compare the result with the corresponding line in the release's `SHA256SUMS.txt`. A matching checksum detects a corrupted or changed download; it does not substitute for a trusted publisher signature.
@@ -56,7 +56,7 @@ Every release job runs unit tests, the GUI test, and smoke tests against the act
 To publish a new version:
 
 1. Update the version in `package.json` and `package-lock.json`, and commit the completed change.
-2. Push `main`, then create and push a matching version tag, for example `v1.6.2`. The workflow rejects a tag that differs from the package version.
+2. Push `main`, then create and push a matching version tag, for example `v1.7.0`. The workflow rejects a tag that differs from the package version.
 3. Wait for all three release builds and tests to pass.
 4. Review the draft's five downloads, checksums, and release notes. Include signing status, platform limitations, and any migration notes.
 5. Publish the draft from GitHub Releases.
